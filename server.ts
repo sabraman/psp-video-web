@@ -28,6 +28,7 @@ const port = Number(process.env.PORT ?? 3000);
 
 Bun.serve({
   port,
+  hostname: "0.0.0.0",
   async fetch(req) {
     const url = new URL(req.url);
     let path = decodeURIComponent(url.pathname);
@@ -43,4 +44,4 @@ Bun.serve({
   },
 });
 
-console.log(`psp-video-web on http://localhost:${port}`);
+console.log(`psp-video-web on http://127.0.0.1:${port}`);

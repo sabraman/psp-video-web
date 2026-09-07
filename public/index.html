@@ -3,19 +3,27 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>PSP Video Converter</title>
+  <title>PSP Video</title>
   <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
   <main class="wrap">
-    <header>
-      <h1>PSP Video</h1>
-      <p class="sub">Convert videos for PlayStation Portable directly in your browser.</p>
+    <header class="header">
+      <div class="header-left">
+        <h1>PSP Video</h1>
+        <p class="sub">Hardware-accelerated web converter</p>
+      </div>
+      <div class="dest-box">
+        <button id="btn-dest" class="dest-btn" type="button" title="Select PSP Memory Stick or local folder">
+          <span class="dest-icon">📁</span>
+          <span id="dest-label">Save to: Browser Downloads</span>
+        </button>
+      </div>
     </header>
 
     <section id="drop" class="drop" tabindex="0" role="button" aria-label="Drop videos here">
       <p class="drop-text">Drop videos here or <span class="browse-link">browse</span></p>
-      <p class="drop-hint">MP4, MKV, MOV, WebM, AVI</p>
+      <p class="drop-hint">MP4, MKV, MOV, WebM</p>
       <input id="picker" type="file" accept="video/*,.mkv,.avi,.mov,.ts,.m2ts,.flv,.wmv,.mpg,.mpeg" multiple hidden />
     </section>
 
@@ -24,13 +32,13 @@
         <label for="preset">Preset</label>
         <select id="preset">
           <option value="go" selected>Go (480×272)</option>
-          <option value="tv">TV-Out (720×480)</option>
+          <option value="tv">TV (720×480)</option>
         </select>
       </div>
       <div class="field">
         <label for="quality">Quality</label>
         <select id="quality">
-          <option value="600000">Small</option>
+          <option value="600000">Compact</option>
           <option value="800000" selected>Balanced</option>
           <option value="1200000">High</option>
         </select>
@@ -45,17 +53,22 @@
       <div class="field">
         <label for="encoder">Encoder</label>
         <select id="encoder">
-          <option value="auto" selected>Auto</option>
+          <option value="auto" selected>Hardware</option>
           <option value="turbo">Turbo</option>
           <option value="software">Software</option>
         </select>
       </div>
     </div>
 
+    <div id="queue-toolbar" class="queue-toolbar" hidden>
+      <span id="queue-count" class="queue-count"></span>
+      <button id="btn-clear-done" class="btn ghost btn-sm" type="button">Clear Finished</button>
+    </div>
+
     <section id="queue" class="queue"></section>
 
     <footer>
-      <p>Copy <code>.mp4</code> files to the <code>VIDEO</code> folder on your Memory Stick.</p>
+      <p>Output files are strictly compliant with PSP firmware (H.264 Baseline L3.0 · AAC-LC · faststart).</p>
     </footer>
   </main>
   <script type="module" src="/app.js"></script>
