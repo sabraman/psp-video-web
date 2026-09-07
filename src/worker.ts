@@ -2,12 +2,14 @@ import {
   convertFile,
   convertMergedFiles,
   encodeSegmentDirect,
-  planSegments,
   parseAvcProfile,
+  planSegments,
   PRESETS,
   profileBadge,
   SegmentedMuxer,
+  type ConvertHooks,
   type ConvertSettings,
+  type PresetName,
   type ProgressStats,
   type SegmentRange,
   type WirePacket,
@@ -37,14 +39,9 @@ type MergeMsg = {
   settings: ConvertSettings;
 };
 
-/**
- * Segment a file across nested workers; each worker streams encoded packets
- * straight back, and the coordinator muxes them in order while later
- * segments are still encoding. No intermediate segment MP4s, no final merge phase.
- */
 async function runSegmented(msg: ConvertMsg, k: number): Promise<void> {
   const { id, file, settings } = msg;
-  const hooks = {
+  const hooks: ConvertHooks = {
     onProgress: (frac: number, label: string, stats?: ProgressStats) =>
       port.postMessage({ type: "progress", id, frac, label, stats }),
     isCancelled: () => cancelled,
@@ -57,13 +54,22 @@ async function runSegmented(msg: ConvertMsg, k: number): Promise<void> {
   await muxer.init();
 
   const configs: (VideoDecoderConfig | undefined)[] = new Array(plan.segments.length).fill(undefined);
+  const workers: Worker[] = [];
 
   try {
     await Promise.all(
       plan.segments.map(
         (seg, i) =>
           new Promise<void>((resolve, reject) => {
-            const w = new Worker(new URL("worker.js", import.meta.url), { type: "module" });
+            let w: Worker;
+            try {
+              w = new Worker("/worker.js", { type: "module" });
+              workers.push(w);
+            } catch (err) {
+              reject(err);
+              return;
+            }
+
             w.onmessage = (ev: MessageEvent) => {
               const m = ev.data as {
                 type: string;
@@ -79,15 +85,15 @@ async function runSegmented(msg: ConvertMsg, k: number): Promise<void> {
                 configs[m.segIndex ?? i] = m.config;
               } else if (m.type === "segdone") {
                 muxer.markSegmentDone(m.segIndex ?? i);
-                w.terminate();
+                try { w.terminate(); } catch {}
                 resolve();
               } else if (m.type === "failed") {
-                w.terminate();
+                try { w.terminate(); } catch {}
                 reject(new Error(m.cancelled ? "__cancelled__" : `Segment ${i + 1}: ${m.error ?? "failed"}`));
               }
             };
             w.onerror = (ev) => {
-              w.terminate();
+              try { w.terminate(); } catch {}
               reject(new Error(`Segment ${i + 1} worker error: ${ev.message}`));
             };
             w.postMessage({
@@ -106,7 +112,7 @@ async function runSegmented(msg: ConvertMsg, k: number): Promise<void> {
     const secs = (performance.now() - t0) / 1000;
 
     const badge = profileBadge(parseAvcProfile(buffer));
-    const preset = PRESETS[settings.preset];
+    const preset = PRESETS[settings.preset as PresetName];
     const dims = `${preset.width}×${preset.height}`;
     const doneNote =
       `done — ${plan.srcInfo} → ${dims}` +
@@ -136,7 +142,10 @@ async function runSegmented(msg: ConvertMsg, k: number): Promise<void> {
       transferables,
     );
   } catch (e) {
-    await muxer.abort();
+    for (const w of workers) {
+      try { w.terminate(); } catch {}
+    }
+    await muxer.abort().catch(() => {});
     throw e;
   }
 }
@@ -179,8 +188,21 @@ port.onmessage = async (ev: MessageEvent): Promise<void> => {
       k = 5;
     }
     if (!seg && k >= 2 && !settings.trim) {
-      await runSegmented(msg, k);
-      return;
+      try {
+        await runSegmented(msg, k);
+        return;
+      } catch (segErr) {
+        if (cancelled || (segErr instanceof Error && segErr.message === "__cancelled__")) {
+          throw segErr;
+        }
+        console.warn("Segmented parallel transcoding failed, auto-fallback to reliable single-pass:", segErr);
+        port.postMessage({
+          type: "progress",
+          id,
+          frac: 0,
+          label: "Switching to safe single-pass mode…",
+        });
+      }
     }
     if (seg && segIndex !== undefined) {
       await encodeSegmentDirect(

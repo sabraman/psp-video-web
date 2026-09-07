@@ -6,7 +6,7 @@
   "description": "In-browser PSP Go video converter. Drag in videos, get 480x272 H.264 Baseline + AAC MP4s. 100% client-side via MediaBunny.",
   "scripts": {
     "dev": "vite dev --port 3005",
-    "build": "vite build",
+    "build": "bun build src/worker.ts --outfile public/worker.js --target browser && vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
     "start": "vite preview --port 3005"

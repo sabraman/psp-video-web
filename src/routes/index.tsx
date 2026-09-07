@@ -20,6 +20,8 @@ import {
   CheckmarkCircle02Icon,
   Layers01Icon,
   Image01Icon,
+  RefreshIcon,
+  Shield01Icon,
 } from "@hugeicons/core-free-icons"
 import { cleanPspTitle, fmtTime, type ConvertSettings, type ProgressStats, type PresetName } from "@/convert"
 
@@ -56,6 +58,8 @@ export interface JobItem {
   audioTracks?: JobAudioTrack[]
   selectedAudioTrack?: number
   duration?: number
+  retryCount?: number
+  forceSafeMode?: boolean
 }
 
 interface WorkerSlot {
@@ -64,11 +68,67 @@ interface WorkerSlot {
   jobId: number | null
 }
 
+const SETTINGS_STORAGE_KEY = "psp_converter_settings_v1"
+const IDB_NAME = "psp_converter_db"
+const IDB_STORE = "settings"
+
+function saveDirectoryHandle(handle: FileSystemDirectoryHandle): Promise<void> {
+  return new Promise((resolve) => {
+    try {
+      const req = indexedDB.open(IDB_NAME, 1)
+      req.onupgradeneeded = () => req.result.createObjectStore(IDB_STORE)
+      req.onsuccess = () => {
+        const tx = req.result.transaction(IDB_STORE, "readwrite")
+        tx.objectStore(IDB_STORE).put(handle, "outDir")
+        tx.oncomplete = () => resolve()
+      }
+      req.onerror = () => resolve()
+    } catch {
+      resolve()
+    }
+  })
+}
+
+function loadDirectoryHandle(): Promise<FileSystemDirectoryHandle | null> {
+  return new Promise((resolve) => {
+    try {
+      const req = indexedDB.open(IDB_NAME, 1)
+      req.onupgradeneeded = () => req.result.createObjectStore(IDB_STORE)
+      req.onsuccess = () => {
+        const tx = req.result.transaction(IDB_STORE, "readonly")
+        const getReq = tx.objectStore(IDB_STORE).get("outDir")
+        getReq.onsuccess = () => resolve(getReq.result || null)
+        getReq.onerror = () => resolve(null)
+      }
+      req.onerror = () => resolve(null)
+    } catch {
+      resolve(null)
+    }
+  })
+}
+
+function clearSavedDirectoryHandle(): Promise<void> {
+  return new Promise((resolve) => {
+    try {
+      const req = indexedDB.open(IDB_NAME, 1)
+      req.onupgradeneeded = () => req.result.createObjectStore(IDB_STORE)
+      req.onsuccess = () => {
+        const tx = req.result.transaction(IDB_STORE, "readwrite")
+        tx.objectStore(IDB_STORE).delete("outDir")
+        tx.oncomplete = () => resolve()
+      }
+      req.onerror = () => resolve()
+    } catch {
+      resolve()
+    }
+  })
+}
+
 function ConverterPage() {
   const [dragActive, setDragActive] = React.useState(false)
   const fileInputRef = React.useRef<HTMLInputElement | null>(null)
 
-  // Settings
+  // Settings with persistent defaults
   const [preset, setPreset] = React.useState<PresetName>("go")
   const [videoBitrate, setVideoBitrate] = React.useState<string>("800000")
   const [audioBitrate, setAudioBitrate] = React.useState<string>("128000")
@@ -89,6 +149,54 @@ function ConverterPage() {
   const poolRef = React.useRef<WorkerSlot[]>([])
   const dirHandleRef = React.useRef<FileSystemDirectoryHandle | null>(null)
   dirHandleRef.current = dirHandle
+
+  // Restore settings and directory handle from storage on mount
+  React.useEffect(() => {
+    try {
+      const saved = localStorage.getItem(SETTINGS_STORAGE_KEY)
+      if (saved) {
+        const parsed = JSON.parse(saved)
+        if (parsed.preset) setPreset(parsed.preset)
+        if (parsed.videoBitrate) setVideoBitrate(parsed.videoBitrate)
+        if (parsed.audioBitrate) setAudioBitrate(parsed.audioBitrate)
+        if (parsed.lcdBoost) setLcdBoost(parsed.lcdBoost)
+        if (parsed.pipelineMode) setPipelineMode(parsed.pipelineMode)
+      }
+    } catch {}
+
+    loadDirectoryHandle().then(async (handle) => {
+      if (!handle) return
+      try {
+        const perm = await (handle as any).queryPermission?.({ mode: "readwrite" })
+        if (perm === "granted") {
+          setDirHandle(handle)
+          setDirName(handle.name)
+        }
+      } catch {}
+    })
+  }, [])
+
+  // Save settings on change
+  const persistSetting = (key: string, val: string) => {
+    try {
+      const cur = JSON.parse(localStorage.getItem(SETTINGS_STORAGE_KEY) || "{}")
+      cur[key] = val
+      localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(cur))
+    } catch {}
+  }
+
+  // Prevent accidental page unload while converting
+  React.useEffect(() => {
+    const handleBeforeUnload = (e: BeforeUnloadEvent) => {
+      const isConverting = jobsRef.current.some((j) => j.status === "converting")
+      if (isConverting) {
+        e.preventDefault()
+        e.returnValue = ""
+      }
+    }
+    window.addEventListener("beforeunload", handleBeforeUnload)
+    return () => window.removeEventListener("beforeunload", handleBeforeUnload)
+  }, [])
 
   // Current settings getter
   const getSettings = React.useCallback((): ConvertSettings => {
@@ -130,14 +238,14 @@ function ConverterPage() {
 
   const spawnWorker = (slot: WorkerSlot) => {
     try {
-      const worker = new Worker(new URL("../worker.ts", import.meta.url), { type: "module" })
+      const worker = new Worker("/worker.js", { type: "module" })
       slot.worker = worker
       worker.onmessage = (e: MessageEvent) => {
         void handleWorkerMessage(slot, e.data)
       }
       worker.onerror = (err) => {
         console.error("Worker error:", err)
-        handleJobError(slot.jobId, err.message || "Failed to process video")
+        handleJobFailure(slot.jobId, err.message || "Worker crashed")
         freeSlot(slot)
       }
     } catch (err) {
@@ -151,12 +259,49 @@ function ConverterPage() {
     pumpQueue()
   }
 
-  const handleJobError = (jobId: number | null, errMsg: string) => {
+  // Auto-retry & error handling with progressive fallback
+  const handleJobFailure = (jobId: number | null, errMsg: string) => {
     if (jobId === null) return
+    const job = jobsRef.current.find((j) => j.id === jobId)
+    if (!job) return
+
+    const retries = job.retryCount || 0
+    if (retries < 2) {
+      const nextRetry = retries + 1
+      const safeDesc = nextRetry === 1 ? "standard single-pass" : "software decoder"
+      toast.warning(`Retrying with ${safeDesc} mode…`)
+
+      setJobs((prev) =>
+        prev.map((j) =>
+          j.id === jobId
+            ? {
+                ...j,
+                status: "queued",
+                progress: 0,
+                retryCount: nextRetry,
+                forceSafeMode: true,
+                note: `Auto-recovering (${safeDesc})…`,
+              }
+            : j
+        )
+      )
+      setTimeout(pumpQueue, 50)
+      return
+    }
+
+    // Permanent failure after all retries exhausted
     setJobs((prev) =>
-      prev.map((j) => (j.id === jobId ? { ...j, status: "failed", note: errMsg } : j))
+      prev.map((j) =>
+        j.id === jobId
+          ? {
+              ...j,
+              status: "failed",
+              note: errMsg || "Could not convert video",
+            }
+          : j
+      )
     )
-    toast.error(`Conversion failed: ${errMsg}`)
+    toast.error(`Could not convert "${job.customTitle || job.file.name}"`)
   }
 
   const handleWorkerMessage = async (slot: WorkerSlot, msg: any) => {
@@ -171,6 +316,7 @@ function ConverterPage() {
       if (msg.label) {
         if (msg.label.includes("muxing")) friendlyNote = "Finalizing video…"
         else if (msg.label.includes("pass")) friendlyNote = "Processing video…"
+        else if (msg.label.includes("single-pass")) friendlyNote = "Safe mode processing…"
         else friendlyNote = "Converting…"
       }
 
@@ -257,21 +403,16 @@ function ConverterPage() {
     }
 
     if (msg.type === "failed") {
-      setJobs((prev) =>
-        prev.map((j) => {
-          if (j.id !== msg.id) return j
-          return {
-            ...j,
-            status: msg.cancelled ? "cancelled" : "failed",
-            note: msg.cancelled ? "Cancelled" : "Failed",
-          }
-        })
-      )
       if (msg.cancelled) {
+        setJobs((prev) =>
+          prev.map((j) => (j.id === msg.id ? { ...j, status: "cancelled", note: "Cancelled" } : j))
+        )
         toast.info("Conversion cancelled")
-      } else {
-        toast.error("Could not convert video")
+        freeSlot(slot)
+        return
       }
+
+      handleJobFailure(msg.id, msg.error || "Could not convert video")
       freeSlot(slot)
     }
   }
@@ -294,27 +435,32 @@ function ConverterPage() {
         prev.map((j) => (j.id === nextJob.id ? { ...j, status: "converting", note: "Starting…" } : j))
       )
 
-      const settings = getSettingsRef.current()
+      const baseSettings = getSettingsRef.current()
+      const effectiveSettings: ConvertSettings = {
+        ...baseSettings,
+        title: nextJob.customTitle,
+        audioTrackIndex: nextJob.selectedAudioTrack,
+        ...(nextJob.forceSafeMode
+          ? {
+              encoderMode: nextJob.retryCount && nextJob.retryCount >= 2 ? "software" : "auto",
+              tunables: { segs: 0 },
+            }
+          : {}),
+      }
+
       if (nextJob.isMerge && nextJob.files) {
         slot.worker.postMessage({
           type: "convert-merge",
           id: nextJob.id,
           files: nextJob.files,
-          settings: {
-            ...settings,
-            title: nextJob.customTitle,
-          },
+          settings: effectiveSettings,
         })
       } else {
         slot.worker.postMessage({
           type: "convert",
           id: nextJob.id,
           file: nextJob.file,
-          settings: {
-            ...settings,
-            title: nextJob.customTitle,
-            audioTrackIndex: nextJob.selectedAudioTrack,
-          },
+          settings: effectiveSettings,
         })
       }
     }
@@ -392,7 +538,7 @@ function ConverterPage() {
     setDragActive(false)
   }
 
-  // Choose direct-to-disk directory
+  // Choose direct-to-disk directory and persist in IndexedDB
   const chooseDirectory = async () => {
     if (typeof window === "undefined" || !("showDirectoryPicker" in window)) {
       toast.error("Saving directly to a folder is not supported in this browser.")
@@ -402,6 +548,7 @@ function ConverterPage() {
       const handle = await (window as any).showDirectoryPicker({ mode: "readwrite" })
       setDirHandle(handle)
       setDirName(handle.name)
+      await saveDirectoryHandle(handle)
       toast.success(`Saving directly to "${handle.name}"`)
     } catch (err: any) {
       if (err.name !== "AbortError") {
@@ -410,9 +557,10 @@ function ConverterPage() {
     }
   }
 
-  const clearDirectory = () => {
+  const clearDirectory = async () => {
     setDirHandle(null)
     setDirName(null)
+    await clearSavedDirectoryHandle()
     toast.info("Switched to browser downloads")
   }
 
@@ -446,6 +594,11 @@ function ConverterPage() {
     toast.success(`Combined ${files.length} videos into one!`)
   }, [pumpQueue])
 
+  const cleanupJobUrls = (j: JobItem) => {
+    if (j.url) URL.revokeObjectURL(j.url)
+    if (j.thmUrl) URL.revokeObjectURL(j.thmUrl)
+  }
+
   const cancelJob = (id: number) => {
     const slot = poolRef.current.find((s) => s.jobId === id)
     if (slot) {
@@ -459,18 +612,39 @@ function ConverterPage() {
   }
 
   const removeJob = (id: number) => {
+    const job = jobsRef.current.find((j) => j.id === id)
+    if (job) cleanupJobUrls(job)
     cancelJob(id)
     setJobs((prev) => prev.filter((j) => j.id !== id))
   }
 
   const clearAllJobs = () => {
     for (const j of jobsRef.current) {
+      cleanupJobUrls(j)
       if (j.status === "converting") {
         cancelJob(j.id)
       }
     }
     setJobs([])
     toast.info("Queue cleared")
+  }
+
+  const retryJob = (id: number, safeMode = false) => {
+    setJobs((prev) =>
+      prev.map((j) =>
+        j.id === id
+          ? {
+              ...j,
+              status: "queued",
+              progress: 0,
+              retryCount: safeMode ? 2 : 0,
+              forceSafeMode: safeMode,
+              note: safeMode ? "Queued (Safe Mode)…" : "In queue",
+            }
+          : j
+      )
+    )
+    setTimeout(pumpQueue, 50)
   }
 
   // Expose global window test API for automated bench loops
@@ -481,6 +655,7 @@ function ConverterPage() {
         jobs: jobsRef.current,
         mergeQueuedJobs,
         clearAllJobs,
+        retryJob,
         getSettings: () => getSettingsRef.current(),
       }
     }
@@ -508,7 +683,15 @@ function ConverterPage() {
                 {/* Resolution */}
                 <div className="flex flex-col gap-1.5">
                   <Label className="text-xs text-muted-foreground">Screen Size</Label>
-                  <Select value={preset} onValueChange={(v) => { if (v) setPreset(v as PresetName) }}>
+                  <Select
+                    value={preset}
+                    onValueChange={(v) => {
+                      if (v) {
+                        setPreset(v as PresetName)
+                        persistSetting("preset", v)
+                      }
+                    }}
+                  >
                     <SelectTrigger className="w-full h-8 text-xs">
                       <SelectValue />
                     </SelectTrigger>
@@ -524,7 +707,15 @@ function ConverterPage() {
                 {/* Video Bitrate */}
                 <div className="flex flex-col gap-1.5">
                   <Label className="text-xs text-muted-foreground">Video Quality</Label>
-                  <Select value={videoBitrate} onValueChange={(v) => { if (v) setVideoBitrate(v) }}>
+                  <Select
+                    value={videoBitrate}
+                    onValueChange={(v) => {
+                      if (v) {
+                        setVideoBitrate(v)
+                        persistSetting("videoBitrate", v)
+                      }
+                    }}
+                  >
                     <SelectTrigger className="w-full h-8 text-xs">
                       <SelectValue />
                     </SelectTrigger>
@@ -542,7 +733,15 @@ function ConverterPage() {
                 {/* Audio Bitrate */}
                 <div className="flex flex-col gap-1.5">
                   <Label className="text-xs text-muted-foreground">Audio Quality</Label>
-                  <Select value={audioBitrate} onValueChange={(v) => { if (v) setAudioBitrate(v) }}>
+                  <Select
+                    value={audioBitrate}
+                    onValueChange={(v) => {
+                      if (v) {
+                        setAudioBitrate(v)
+                        persistSetting("audioBitrate", v)
+                      }
+                    }}
+                  >
                     <SelectTrigger className="w-full h-8 text-xs">
                       <SelectValue />
                     </SelectTrigger>
@@ -559,7 +758,15 @@ function ConverterPage() {
                 {/* LCD Shadow Boost */}
                 <div className="flex flex-col gap-1.5">
                   <Label className="text-xs text-muted-foreground">Colors</Label>
-                  <Select value={lcdBoost} onValueChange={(v) => { if (v) setLcdBoost(v) }}>
+                  <Select
+                    value={lcdBoost}
+                    onValueChange={(v) => {
+                      if (v) {
+                        setLcdBoost(v)
+                        persistSetting("lcdBoost", v)
+                      }
+                    }}
+                  >
                     <SelectTrigger className="w-full h-8 text-xs">
                       <SelectValue />
                     </SelectTrigger>
@@ -575,7 +782,15 @@ function ConverterPage() {
                 {/* Parallel Pipeline */}
                 <div className="flex flex-col gap-1.5">
                   <Label className="text-xs text-muted-foreground">Speed</Label>
-                  <Select value={pipelineMode} onValueChange={(v) => { if (v) setPipelineMode(v) }}>
+                  <Select
+                    value={pipelineMode}
+                    onValueChange={(v) => {
+                      if (v) {
+                        setPipelineMode(v)
+                        persistSetting("pipelineMode", v)
+                      }
+                    }}
+                  >
                     <SelectTrigger className="w-full h-8 text-xs">
                       <SelectValue />
                     </SelectTrigger>
@@ -705,6 +920,11 @@ function ConverterPage() {
                             Combined
                           </Badge>
                         )}
+                        {job.forceSafeMode && (
+                          <Badge variant="outline" className="text-[10px] shrink-0 border-amber-500/40 text-amber-400">
+                            Safe Mode
+                          </Badge>
+                        )}
                       </div>
 
                       <div className="flex items-center gap-1.5 shrink-0">
@@ -813,6 +1033,29 @@ function ConverterPage() {
                             <HugeiconsIcon icon={CheckmarkCircle02Icon} className="size-3.5" />
                             Saved directly to PSP
                           </span>
+                        )}
+
+                        {job.status === "failed" && (
+                          <div className="flex items-center gap-2">
+                            <Button
+                              variant="outline"
+                              size="xs"
+                              onClick={() => retryJob(job.id, false)}
+                              className="text-xs gap-1"
+                            >
+                              <HugeiconsIcon icon={RefreshIcon} className="size-3" />
+                              Retry
+                            </Button>
+                            <Button
+                              variant="outline"
+                              size="xs"
+                              onClick={() => retryJob(job.id, true)}
+                              className="text-xs gap-1 border-amber-500/50 text-amber-400 hover:text-amber-300"
+                            >
+                              <HugeiconsIcon icon={Shield01Icon} className="size-3" />
+                              Retry in Safe Mode
+                            </Button>
+                          </div>
                         )}
                       </div>
 

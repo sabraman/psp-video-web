@@ -681,6 +681,7 @@ export async function convertFile(
 
         const pumpAudio = async (): Promise<void> => {
           if (!aTrack) return;
+          try {
           if (audioPacketSource && aCfg) {
             const aSink = new EncodedPacketSink(aTrack);
             let firstA = true;
@@ -715,6 +716,11 @@ export async function convertFile(
             }
             aFrac = 1;
             render("audio");
+          }
+          } catch (audioErr) {
+            console.warn("Audio processing encountered an issue; completing stream safely:", audioErr);
+            aFrac = 1;
+            render("video");
           }
         };
 
@@ -756,8 +762,20 @@ export async function convertFile(
       buffer = await encodeOnce({ preferHw: false, latency: "quality", pass: "converting (software)" });
       how = "software";
     } else if (settings.encoderMode === "turbo") {
-      buffer = await encodeOnce({ preferHw: true, latency: "realtime", pass: "converting (turbo)" });
-      how = "turbo";
+      try {
+        buffer = await encodeOnce({ preferHw: true, latency: "realtime", pass: "converting (turbo)" });
+        how = "turbo";
+      } catch (hwErr) {
+        if (cancelled()) throw hwErr;
+        console.warn("Hardware turbo encode failed, auto-falling back to software:", hwErr);
+        report(0, "Hardware encoder unavailable, switching to software…");
+        buffer = await encodeOnce({
+          preferHw: false,
+          latency: "quality",
+          pass: "software fallback",
+        });
+        how = "software-fallback";
+      }
       const prof = parseAvcProfile(buffer);
       if (!cancelled() && (!prof || prof.profileIdc !== 66 || prof.levelIdc > 30)) {
         buffer = await encodeOnce({
@@ -768,8 +786,20 @@ export async function convertFile(
         how = "turbo→software";
       }
     } else {
-      buffer = await encodeOnce({ preferHw: true, latency: latencyMode, pass: "converting (hardware)" });
-      how = "hardware";
+      try {
+        buffer = await encodeOnce({ preferHw: true, latency: latencyMode, pass: "converting (hardware)" });
+        how = "hardware";
+      } catch (hwErr) {
+        if (cancelled()) throw hwErr;
+        console.warn("Hardware encode failed, auto-falling back to software:", hwErr);
+        report(0, "Hardware encoder unavailable, switching to software…");
+        buffer = await encodeOnce({
+          preferHw: false,
+          latency: "quality",
+          pass: "software fallback",
+        });
+        how = "software-fallback";
+      }
       const prof = parseAvcProfile(buffer);
       if (!cancelled() && (!prof || prof.profileIdc !== 66 || prof.levelIdc > 30)) {
         buffer = await encodeOnce({
