@@ -1,14 +1,24 @@
-import type { ConvertSettings, ProgressStats, Tunables } from "./convert";
+import { ALL_FORMATS, BlobSource, Input } from "mediabunny";
+import {
+  cleanPspTitle,
+  type ConvertSettings,
+  type ProgressStats,
+  type Tunables,
+} from "./convert";
 
 type Status = "queued" | "converting" | "done" | "failed" | "cancelled";
 
 interface Job {
   id: number;
   file: File;
+  files?: File[];
+  isMerge?: boolean;
+  customTitle?: string;
   status: Status;
   progress: number;
   note: string;
   url?: string;
+  thmUrl?: string;
   outName?: string;
   outSize?: number;
   profileBadge?: { text: string; cls: string };
@@ -17,6 +27,10 @@ interface Job {
   savedDirect?: boolean;
   stats?: ProgressStats;
   error?: string;
+  audioTrackIndex?: number;
+  trimStart?: number;
+  trimEnd?: number;
+  duration?: number;
   els: Record<string, HTMLElement>;
 }
 
@@ -60,11 +74,13 @@ const URL_TUNABLES: Tunables | undefined = (() => {
 })();
 
 function getSettings(): ConvertSettings {
+  const lcdBoostSelect = document.querySelector<HTMLSelectElement>("#lcd-boost");
   return {
     preset: ($("#preset") as HTMLSelectElement).value as ConvertSettings["preset"],
     videoBitrate: Number(($("#quality") as HTMLSelectElement).value),
     audioBitrate: Number(($("#audio-bitrate") as HTMLSelectElement).value),
     encoderMode: ($("#encoder") as HTMLSelectElement).value as ConvertSettings["encoderMode"],
+    lcdBoost: lcdBoostSelect ? lcdBoostSelect.value === "on" : false,
     tunables: URL_TUNABLES,
   };
 }
@@ -77,6 +93,7 @@ function addFiles(files: FileList | File[]): void {
     const job: Job = {
       id: nextId++,
       file,
+      customTitle: cleanPspTitle(file.name),
       status: "queued",
       progress: 0,
       note: "queued",
@@ -84,9 +101,41 @@ function addFiles(files: FileList | File[]): void {
     };
     jobs.push(job);
     renderJob(job);
+    void probeAudioAndDuration(job);
   }
   updateToolbar();
   pump();
+}
+
+async function probeAudioAndDuration(job: Job): Promise<void> {
+  if (job.isMerge) return;
+  try {
+    const input = new Input({
+      source: new BlobSource(job.file, { maxCacheSize: 8 * 1024 * 1024 }),
+      formats: ALL_FORMATS,
+    });
+    const [aTracks, dur] = await Promise.all([
+      (input.getAudioTracks().catch(() => [])) as Promise<any[]>,
+      input.computeDuration().catch(() => 0),
+    ]);
+    job.duration = dur;
+    if (aTracks.length > 1 && job.els.optRow && job.els.audioSelect) {
+      job.els.optRow.hidden = false;
+      const select = job.els.audioSelect as HTMLSelectElement;
+      select.innerHTML = "";
+      aTracks.forEach((t: any, i: number) => {
+        const opt = document.createElement("option");
+        opt.value = String(i);
+        opt.textContent = `Audio ${i + 1}: ${t.language ? String(t.language).toUpperCase() : "Track"} (${t.codec || "AAC"})`;
+        select.appendChild(opt);
+      });
+      select.onchange = () => {
+        job.audioTrackIndex = Number(select.value);
+      };
+    }
+  } catch {
+    /* ignore probe failures */
+  }
 }
 
 function renderJob(job: Job): void {
@@ -95,8 +144,24 @@ function renderJob(job: Job): void {
   div.className = "job";
   div.innerHTML = `
     <div class="job-top">
-      <span class="job-name"></span>
-      <button class="btn ghost cancel" type="button">Cancel</button>
+      <div class="job-title-wrap">
+        <input class="job-title-input" type="text" value="${escapeHtml(job.customTitle || job.file.name)}" title="Output title (click to rename)" />
+      </div>
+      <div class="job-actions">
+        <button class="btn ghost cancel" type="button">Cancel</button>
+      </div>
+    </div>
+    <div class="job-options-row" hidden>
+      <label>
+        <span>Audio:</span>
+        <select class="job-opt-select audio-select"></select>
+      </label>
+      <label class="trim-wrap" hidden>
+        <span>Trim:</span>
+        <input class="job-opt-input trim-start" type="text" placeholder="0:00" />
+        <span>to</span>
+        <input class="job-opt-input trim-end" type="text" placeholder="end" />
+      </label>
     </div>
     <div class="job-src"></div>
     <div class="bar"><div></div></div>
@@ -111,17 +176,27 @@ function renderJob(job: Job): void {
   };
   job.els = {
     root: div,
-    name: q(".job-name"),
+    titleInput: q(".job-title-input"),
+    optRow: q(".job-options-row"),
+    audioSelect: q(".audio-select"),
     src: q(".job-src"),
     bar: q(".bar > div"),
     meta: q(".job-meta"),
     err: q(".err"),
     cancel: q(".cancel"),
   };
-  job.els.name.textContent = job.file.name;
-  job.els.src.textContent = `${fmtBytes(job.file.size)} — ${job.note}`;
+
+  const titleInput = job.els.titleInput as HTMLInputElement;
+  titleInput.oninput = () => {
+    job.customTitle = titleInput.value.trim() || cleanPspTitle(job.file.name);
+  };
+
   (job.els.cancel as HTMLButtonElement).onclick = () => cancelJob(job.id);
   refresh(job, job.note);
+}
+
+function escapeHtml(str: string): string {
+  return str.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
 function refresh(job: Job, note: string): void {
@@ -130,7 +205,10 @@ function refresh(job: Job, note: string): void {
   if (job.status === "converting" && job.stats && job.stats.fps > 0) {
     statText = ` · ${Math.round(job.stats.fps)} fps · ${job.stats.speed.toFixed(1)}× · ETA ${fmtDuration(job.stats.eta)}`;
   }
-  job.els.src.textContent = `${fmtBytes(job.file.size)} — ${note}${statText}`;
+  const sizeInfo = job.isMerge && job.files
+    ? `${job.files.length} files (${fmtBytes(job.files.reduce((acc, f) => acc + f.size, 0))})`
+    : fmtBytes(job.file.size);
+  job.els.src.textContent = `${sizeInfo} — ${note}${statText}`;
   job.els.bar.style.width = `${Math.round(job.progress * 100)}%`;
   const root = job.els.root;
   root.classList.toggle("done", job.status === "done");
@@ -143,18 +221,30 @@ function refresh(job: Job, note: string): void {
   if (job.dims) meta.append(badge(job.dims, "grey"));
   if (job.profileBadge) meta.append(badge(job.profileBadge.text, job.profileBadge.cls));
   if (job.hasSubtitles) meta.append(badge("subs stripped (PSP safe)", "blue"));
-  if (job.savedDirect) meta.append(badge("✓ saved to disk", "green"));
+  if (job.savedDirect) meta.append(badge("✓ saved to disk (.mp4 + .thm)", "green"));
   if (job.outSize !== undefined) meta.append(badge(fmtBytes(job.outSize), "grey"));
 
   if (!job.savedDirect && job.url && job.outName) {
+    const group = document.createElement("div");
+    group.className = "dl-group";
+
     const a = document.createElement("a");
     a.href = job.url;
     a.download = job.outName;
-    const btn = document.createElement("button");
-    btn.className = "btn";
-    btn.textContent = `Download`;
-    a.appendChild(btn);
-    meta.append(a);
+    a.className = "btn";
+    a.textContent = "Download MP4";
+    group.appendChild(a);
+
+    if (job.thmUrl) {
+      const aThm = document.createElement("a");
+      aThm.href = job.thmUrl;
+      aThm.download = job.outName.replace(/\.mp4$/i, ".thm");
+      aThm.className = "btn ghost btn-sm";
+      aThm.textContent = ".THM Cover";
+      aThm.title = "Save next to video on PSP Memory Stick for XMB menu thumbnail";
+      group.appendChild(aThm);
+    }
+    meta.append(group);
   }
   if (job.error) {
     job.els.err.hidden = false;
@@ -207,11 +297,45 @@ function clearFinishedJobs(): void {
   const finished = jobs.filter((j) => j.status === "done" || j.status === "failed" || j.status === "cancelled");
   for (const job of finished) {
     if (job.url) URL.revokeObjectURL(job.url);
+    if (job.thmUrl) URL.revokeObjectURL(job.thmUrl);
     job.els.root?.remove();
     const idx = jobs.indexOf(job);
     if (idx !== -1) jobs.splice(idx, 1);
   }
   updateToolbar();
+}
+
+function mergeQueuedJobs(): void {
+  const queued = jobs.filter((j) => j.status === "queued");
+  if (queued.length < 2) {
+    alert("Please add at least 2 videos to queue to merge them into a continuous marathon.");
+    return;
+  }
+  const files = queued.map((j) => j.file);
+  const firstName = files[0].name;
+  const mergedTitle = cleanPspTitle(firstName) + " Marathon";
+
+  for (const j of queued) {
+    j.els.root?.remove();
+    const idx = jobs.indexOf(j);
+    if (idx !== -1) jobs.splice(idx, 1);
+  }
+
+  const mergedJob: Job = {
+    id: nextId++,
+    file: files[0],
+    files,
+    isMerge: true,
+    customTitle: mergedTitle,
+    status: "queued",
+    progress: 0,
+    note: `queued (${files.length} episodes to merge)`,
+    els: {},
+  };
+  jobs.push(mergedJob);
+  renderJob(mergedJob);
+  updateToolbar();
+  pump();
 }
 
 // ---------- worker pool ----------
@@ -239,8 +363,35 @@ function pump(): void {
     job.status = "converting";
     slot.busy = true;
     slot.jobId = job.id;
-    refresh(job, "starting…");
-    slot.worker.postMessage({ type: "convert", id: job.id, file: job.file, settings: getSettings() });
+
+    if (job.isMerge && job.files) {
+      refresh(job, "starting marathon merge…");
+      slot.worker.postMessage({
+        type: "convert-merge",
+        id: job.id,
+        files: job.files,
+        settings: {
+          ...getSettings(),
+          title: job.customTitle,
+        },
+      });
+    } else {
+      refresh(job, "starting…");
+      slot.worker.postMessage({
+        type: "convert",
+        id: job.id,
+        file: job.file,
+        settings: {
+          ...getSettings(),
+          title: job.customTitle,
+          audioTrackIndex: job.audioTrackIndex,
+          trim:
+            job.trimStart !== undefined && job.trimEnd !== undefined
+              ? { start: job.trimStart, end: job.trimEnd }
+              : undefined,
+        },
+      });
+    }
   }
   updateToolbar();
 }
@@ -273,6 +424,7 @@ interface WorkerResult {
   label?: string;
   stats?: ProgressStats;
   buffer?: ArrayBuffer;
+  thmBuffer?: ArrayBuffer;
   profileText?: string;
   profileCls?: string;
   doneNote?: string;
@@ -296,8 +448,9 @@ async function onWorkerMessage(slot: Slot, msg: WorkerResult): Promise<void> {
     return;
   }
   if (msg.type === "done" && msg.buffer) {
-    const stem = job.file.name.replace(/\.[^.]+$/, "") || "video";
-    job.outName = `${stem}_psp.mp4`;
+    const rawStem = job.customTitle || job.file.name.replace(/\.[^.]+$/, "") || "video";
+    const cleanStem = rawStem.replace(/[^\w\s.-]/g, "").trim().replace(/\s+/g, "_");
+    job.outName = `${cleanStem}.mp4`;
     job.profileBadge = { text: msg.profileText ?? "?", cls: msg.profileCls ?? "grey" };
     job.outSize = msg.outSize;
     job.dims = msg.dims;
@@ -310,15 +463,31 @@ async function onWorkerMessage(slot: Slot, msg: WorkerResult): Promise<void> {
         const writable = await (fileHandle as any).createWritable();
         await writable.write(msg.buffer);
         await writable.close();
+
+        if (msg.thmBuffer) {
+          const thmName = `${cleanStem}.thm`;
+          const thmHandle = await destinationDir.getFileHandle(thmName, { create: true });
+          const thmWritable = await (thmHandle as any).createWritable();
+          await thmWritable.write(msg.thmBuffer);
+          await thmWritable.close();
+        }
         job.savedDirect = true;
       } catch (err) {
         console.warn("Direct save failed, falling back to blob:", err);
         const blob = new Blob([msg.buffer], { type: "video/mp4" });
         job.url = URL.createObjectURL(blob);
+        if (msg.thmBuffer) {
+          const thmBlob = new Blob([msg.thmBuffer], { type: "image/jpeg" });
+          job.thmUrl = URL.createObjectURL(thmBlob);
+        }
       }
     } else {
       const blob = new Blob([msg.buffer], { type: "video/mp4" });
       job.url = URL.createObjectURL(blob);
+      if (msg.thmBuffer) {
+        const thmBlob = new Blob([msg.thmBuffer], { type: "image/jpeg" });
+        job.thmUrl = URL.createObjectURL(thmBlob);
+      }
     }
 
     job.status = "done";
@@ -349,9 +518,14 @@ function init(): void {
   const btnDest = $("#btn-dest");
   const destLabel = $("#dest-label");
   const btnClearDone = $("#btn-clear-done");
+  const btnMerge = $("#btn-merge");
 
   if (btnClearDone) {
     btnClearDone.addEventListener("click", () => clearFinishedJobs());
+  }
+
+  if (btnMerge) {
+    btnMerge.addEventListener("click", () => mergeQueuedJobs());
   }
 
   if (btnDest && destLabel) {
@@ -399,9 +573,10 @@ function init(): void {
     }
   });
 
-  // Test hook (used by automated verification): window.__psp.addFiles([...])
+  // Test hook: window.__psp
   (window as unknown as { __psp: unknown }).__psp = {
     addFiles: (files: File[]) => addFiles(files),
+    mergeQueuedJobs: () => mergeQueuedJobs(),
     jobs,
     poolSize: POOL_SIZE,
   };

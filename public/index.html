@@ -58,17 +58,27 @@
           <option value="software">Software</option>
         </select>
       </div>
+      <div class="field">
+        <label for="lcd-boost">Screen</label>
+        <select id="lcd-boost">
+          <option value="off" selected>Standard (Go / Modern)</option>
+          <option value="on">PSP-1000/2000 LCD Boost</option>
+        </select>
+      </div>
     </div>
 
     <div id="queue-toolbar" class="queue-toolbar" hidden>
       <span id="queue-count" class="queue-count"></span>
-      <button id="btn-clear-done" class="btn ghost btn-sm" type="button">Clear Finished</button>
+      <div class="toolbar-actions">
+        <button id="btn-merge" class="btn ghost btn-sm" type="button" title="Merge all queued files into one continuous marathon video">Merge into Marathon</button>
+        <button id="btn-clear-done" class="btn ghost btn-sm" type="button">Clear Finished</button>
+      </div>
     </div>
 
     <section id="queue" class="queue"></section>
 
     <footer>
-      <p>Output files are strictly compliant with PSP firmware (H.264 Baseline L3.0 · AAC-LC · faststart).</p>
+      <p>Output files are strictly compliant with PSP firmware (H.264 Baseline L3.0 · AAC-LC · faststart · .THM auto-generated).</p>
     </footer>
   </main>
   <script type="module" src="/app.js"></script>

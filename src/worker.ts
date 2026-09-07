@@ -1,5 +1,6 @@
 import {
   convertFile,
+  convertMergedFiles,
   encodeSegmentDirect,
   planSegments,
   parseAvcProfile,
@@ -29,6 +30,13 @@ type ConvertMsg = {
   segIndex?: number;
 };
 
+type MergeMsg = {
+  type: "convert-merge";
+  id: number;
+  files: File[];
+  settings: ConvertSettings;
+};
+
 /**
  * Segment a file across nested workers; each worker streams encoded packets
  * straight back, and the coordinator muxes them in order while later
@@ -42,7 +50,7 @@ async function runSegmented(msg: ConvertMsg, k: number): Promise<void> {
     isCancelled: () => cancelled,
   };
 
-  const plan = await planSegments(file, k);
+  const plan = await planSegments(file, k, settings.trim);
   const t0 = performance.now();
 
   const muxer = new SegmentedMuxer(file, settings, hooks, plan.segments.length, plan.duration);
@@ -102,13 +110,20 @@ async function runSegmented(msg: ConvertMsg, k: number): Promise<void> {
     const dims = `${preset.width}×${preset.height}`;
     const doneNote =
       `done — ${plan.srcInfo} → ${dims}` +
+      (settings.lcdBoost ? " · LCD Boosted" : "") +
       ` · segmented×${plan.segments.length} streamed in ${secs.toFixed(1)}s`;
+
+    const transferables: Transferable[] = [buffer];
+    if (muxer.thumbBytes?.buffer) {
+      transferables.push(muxer.thumbBytes.buffer);
+    }
 
     port.postMessage(
       {
         type: "done",
         id,
         buffer,
+        thmBuffer: muxer.thumbBytes?.buffer,
         profileText: badge.text,
         profileCls: badge.cls,
         srcInfo: plan.srcInfo,
@@ -118,7 +133,7 @@ async function runSegmented(msg: ConvertMsg, k: number): Promise<void> {
         outSize: buffer.byteLength,
         doneNote,
       },
-      [buffer],
+      transferables,
     );
   } catch (e) {
     await muxer.abort();
@@ -127,34 +142,53 @@ async function runSegmented(msg: ConvertMsg, k: number): Promise<void> {
 }
 
 port.onmessage = async (ev: MessageEvent): Promise<void> => {
-  const msg = ev.data as ConvertMsg | { type: "cancel" };
+  const msg = ev.data as ConvertMsg | MergeMsg | { type: "cancel" };
   if (msg.type === "cancel") {
     cancelled = true;
     return;
   }
-  if (msg.type !== "convert") return;
   cancelled = false;
+
+  if (msg.type === "convert-merge") {
+    const { id, files, settings } = msg;
+    try {
+      const r = await convertMergedFiles(files, settings, {
+        onProgress: (frac, label, stats) => port.postMessage({ type: "progress", id, frac, label, stats }),
+        isCancelled: () => cancelled,
+      });
+      const transferables: Transferable[] = [r.buffer];
+      if (r.thmBuffer) transferables.push(r.thmBuffer);
+      port.postMessage({ type: "done", id, ...r }, transferables);
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      port.postMessage({
+        type: "failed",
+        id,
+        error: message === "__cancelled__" ? "cancelled" : message,
+        cancelled: message === "__cancelled__",
+      });
+    }
+    return;
+  }
+
+  if (msg.type !== "convert") return;
   const { id, file, settings, seg, segIndex } = msg;
   try {
     let k = settings.tunables?.segs ?? 0;
     if (k === 0 && (file.size >= 25 * 1024 * 1024 || file.name.includes("prizrak") || file.name.includes("film60"))) {
-      // Auto: segmented parallel transcode delivers 2.5x faster encode for medium & long videos
       k = 5;
     }
-    if (!seg && k >= 2) {
+    if (!seg && k >= 2 && !settings.trim) {
       await runSegmented(msg, k);
       return;
     }
     if (seg && segIndex !== undefined) {
-      // Segment worker: decode → scale → direct WebCodecs encode → stream packets
       await encodeSegmentDirect(
         file,
         settings,
         seg,
         {
-          onProgress: () => {
-            /* coordinator reports mux-based progress */
-          },
+          onProgress: () => {},
           isCancelled: () => cancelled,
         },
         (packet) => port.postMessage({ type: "packet", id, segIndex, packet }, [packet.data]),
@@ -167,7 +201,9 @@ port.onmessage = async (ev: MessageEvent): Promise<void> => {
       onProgress: (frac, label, stats) => port.postMessage({ type: "progress", id, frac, label, stats }),
       isCancelled: () => cancelled,
     });
-    port.postMessage({ type: "done", id, ...r }, [r.buffer]);
+    const transferables: Transferable[] = [r.buffer];
+    if (r.thmBuffer) transferables.push(r.thmBuffer);
+    port.postMessage({ type: "done", id, ...r }, transferables);
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e);
     port.postMessage({
