@@ -14,6 +14,12 @@ export const Route = createRootRoute({
       { rel: "stylesheet", href: appCss },
     ],
   }),
+  notFoundComponent: () => (
+    <main className="container mx-auto flex flex-col items-center justify-center min-h-[60vh] gap-4 p-4 text-center">
+      <h1 className="text-2xl font-bold font-heading">Page Not Found</h1>
+      <p className="text-sm text-muted-foreground">The requested page could not be found.</p>
+    </main>
+  ),
   shellComponent: RootDocument,
 })
 
