@@ -1,6 +1,9 @@
 node_modules/
+dist/
 public/app.js
 public/app.js.map
 public/worker.js
 public/worker.js.map
 .DS_Store
+*.png
+test_tanstack_cdp.ts
