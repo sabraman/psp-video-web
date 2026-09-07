@@ -1,6 +1,6 @@
 import * as React from "react"
 import { createFileRoute } from "@tanstack/react-router"
-import { Card, CardHeader, CardTitle, CardDescription, CardContent, CardFooter } from "@/components/ui/card"
+import { Card, CardHeader, CardTitle, CardDescription, CardContent } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import { Progress } from "@/components/ui/progress"
@@ -8,21 +8,17 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Select, SelectTrigger, SelectValue, SelectContent, SelectGroup, SelectItem } from "@/components/ui/select"
 import { Separator } from "@/components/ui/separator"
-import { TooltipProvider } from "@/components/ui/tooltip"
+import { TooltipProvider, Tooltip, TooltipTrigger, TooltipContent } from "@/components/ui/tooltip"
 import { toast } from "sonner"
 import { HugeiconsIcon } from "@hugeicons/react"
 import {
-  Video01Icon,
-  PlayIcon,
   Download01Icon,
   Folder01Icon,
   Delete02Icon,
-  SparklesIcon,
   Film01Icon,
   Settings01Icon,
   CheckmarkCircle02Icon,
   Layers01Icon,
-  Alert02Icon,
   Image01Icon,
 } from "@hugeicons/core-free-icons"
 import { cleanPspTitle, fmtTime, type ConvertSettings, type ProgressStats, type PresetName } from "@/convert"
@@ -141,7 +137,7 @@ function ConverterPage() {
       }
       worker.onerror = (err) => {
         console.error("Worker error:", err)
-        handleJobError(slot.jobId, err.message || "Worker crashed")
+        handleJobError(slot.jobId, err.message || "Failed to process video")
         freeSlot(slot)
       }
     } catch (err) {
@@ -160,7 +156,7 @@ function ConverterPage() {
     setJobs((prev) =>
       prev.map((j) => (j.id === jobId ? { ...j, status: "failed", note: errMsg } : j))
     )
-    toast.error(`Job failed: ${errMsg}`)
+    toast.error(`Conversion failed: ${errMsg}`)
   }
 
   const handleWorkerMessage = async (slot: WorkerSlot, msg: any) => {
@@ -171,6 +167,13 @@ function ConverterPage() {
     }
 
     if (msg.type === "progress") {
+      let friendlyNote = "Converting…"
+      if (msg.label) {
+        if (msg.label.includes("muxing")) friendlyNote = "Finalizing video…"
+        else if (msg.label.includes("pass")) friendlyNote = "Processing video…"
+        else friendlyNote = "Converting…"
+      }
+
       setJobs((prev) =>
         prev.map((j) => {
           if (j.id !== msg.id) return j
@@ -178,7 +181,7 @@ function ConverterPage() {
             ...j,
             progress: msg.frac ?? j.progress,
             stats: msg.stats ?? j.stats,
-            note: msg.label ?? j.note,
+            note: friendlyNote,
           }
         })
       )
@@ -212,7 +215,7 @@ function ConverterPage() {
           savedDirect = true
           toast.success(`Saved directly to ${outName}`)
         } catch (err) {
-          console.warn("Direct save failed, falling back to blob:", err)
+          console.warn("Direct save failed, falling back to download:", err)
         }
       }
 
@@ -223,7 +226,7 @@ function ConverterPage() {
           const thmBlob = new Blob([msg.thmBuffer], { type: "image/jpeg" })
           thmUrl = URL.createObjectURL(thmBlob)
         }
-        toast.success(`Converted ${outName} ready!`)
+        toast.success(`"${outName}" is ready!`)
       }
 
       setJobs((prev) =>
@@ -233,7 +236,7 @@ function ConverterPage() {
             ...j,
             status: "done",
             progress: 1,
-            note: msg.doneNote ?? "Complete",
+            note: "Ready",
             buffer: msg.buffer,
             thmBuffer: msg.thmBuffer,
             outName,
@@ -243,8 +246,8 @@ function ConverterPage() {
             dims: msg.dims,
             outSize: msg.outSize,
             profileBadge: {
-              text: msg.profileText ?? "Baseline L2.1 ✓ PSP-ready",
-              cls: msg.profileCls ?? "green",
+              text: "PSP Ready",
+              cls: "green",
             },
           }
         })
@@ -260,14 +263,14 @@ function ConverterPage() {
           return {
             ...j,
             status: msg.cancelled ? "cancelled" : "failed",
-            note: msg.error || "Failed",
+            note: msg.cancelled ? "Cancelled" : "Failed",
           }
         })
       )
       if (msg.cancelled) {
         toast.info("Conversion cancelled")
       } else {
-        toast.error(`Error: ${msg.error}`)
+        toast.error("Could not convert video")
       }
       freeSlot(slot)
     }
@@ -360,13 +363,13 @@ function ConverterPage() {
           customTitle: cleanTitle,
           status: "queued",
           progress: 0,
-          note: "Queued",
+          note: "In queue",
         }
       })
 
       setJobs((prev) => [...prev, ...newJobs])
       setTimeout(pumpQueue, 50)
-      toast.info(`Added ${newJobs.length} video${newJobs.length > 1 ? "s" : ""} to queue`)
+      toast.info(`Added ${newJobs.length} video${newJobs.length > 1 ? "s" : ""}`)
     },
     [pumpQueue]
   )
@@ -392,14 +395,14 @@ function ConverterPage() {
   // Choose direct-to-disk directory
   const chooseDirectory = async () => {
     if (typeof window === "undefined" || !("showDirectoryPicker" in window)) {
-      toast.error("File System Access API not supported in this browser.")
+      toast.error("Saving directly to a folder is not supported in this browser.")
       return
     }
     try {
       const handle = await (window as any).showDirectoryPicker({ mode: "readwrite" })
       setDirHandle(handle)
       setDirName(handle.name)
-      toast.success(`Disk streaming active: ${handle.name}`)
+      toast.success(`Saving directly to "${handle.name}"`)
     } catch (err: any) {
       if (err.name !== "AbortError") {
         console.error("Directory pick failed:", err)
@@ -413,17 +416,17 @@ function ConverterPage() {
     toast.info("Switched to browser downloads")
   }
 
-  // Merge queued files into a marathon video
+  // Merge queued files into a single video
   const mergeQueuedJobs = React.useCallback(() => {
     const queued = jobsRef.current.filter((j) => j.status === "queued" && !j.isMerge)
     if (queued.length < 2) {
-      toast.error("Need at least 2 queued videos to merge into a Marathon.")
+      toast.error("Select at least 2 videos to combine.")
       return
     }
 
     const files = queued.map((j) => j.file)
     const firstTitle = queued[0].customTitle
-    const marathonTitle = `${firstTitle} Marathon (${files.length} eps)`
+    const marathonTitle = `${firstTitle} (Combined ${files.length} parts)`
 
     const id = nextIdRef.current++
     const marathonJob: JobItem = {
@@ -434,13 +437,13 @@ function ConverterPage() {
       customTitle: marathonTitle,
       status: "queued",
       progress: 0,
-      note: `Merged Marathon (${files.length} files)`,
+      note: `Combined video (${files.length} parts)`,
     }
 
     const queuedIds = new Set(queued.map((j) => j.id))
     setJobs((prev) => [...prev.filter((j) => !queuedIds.has(j.id)), marathonJob])
     setTimeout(pumpQueue, 50)
-    toast.success(`Merged ${files.length} episodes into single marathon!`)
+    toast.success(`Combined ${files.length} videos into one!`)
   }, [pumpQueue])
 
   const cancelJob = (id: number) => {
@@ -489,58 +492,30 @@ function ConverterPage() {
   return (
     <TooltipProvider>
       <div className="flex min-h-screen flex-col bg-background text-foreground selection:bg-primary selection:text-primary-foreground">
-        {/* Top Navigation */}
-        <header className="sticky top-0 z-40 border-b border-border bg-background/80 backdrop-blur-md">
-          <div className="mx-auto flex h-14 max-w-6xl items-center justify-between px-4 sm:px-6">
-            <div className="flex items-center gap-3">
-              <div className="flex size-8 items-center justify-center rounded-xl bg-primary text-primary-foreground shadow-sm">
-                <HugeiconsIcon icon={Video01Icon} className="size-5" />
-              </div>
-              <div>
-                <span className="font-heading text-base font-semibold tracking-tight">PSP Video</span>
-                <span className="ml-2 text-xs text-muted-foreground font-mono">WebCodecs + MediaBunny</span>
-              </div>
-            </div>
-
-            <div className="flex items-center gap-2">
-              <Badge variant="outline" className="font-mono text-[11px] gap-1 border-border">
-                <HugeiconsIcon icon={SparklesIcon} className="size-3 text-primary" />
-                H.264 Baseline L2.1
-              </Badge>
-              {dirName ? (
-                <Badge variant="default" className="font-mono text-[11px] gap-1 bg-emerald-600 text-white">
-                  <HugeiconsIcon icon={Folder01Icon} className="size-3" />
-                  ms0:/{dirName}
-                </Badge>
-              ) : null}
-            </div>
-          </div>
-        </header>
-
         {/* Main Content Area */}
-        <main className="mx-auto flex w-full max-w-6xl flex-1 flex-col gap-6 p-4 sm:p-6 lg:flex-row">
+        <main className="mx-auto flex w-full max-w-6xl flex-1 flex-col gap-6 p-4 py-6 sm:p-8 lg:flex-row">
           {/* Settings Column */}
           <section className="w-full lg:w-80 shrink-0 flex flex-col gap-4">
             <Card className="rounded-2xl border-border bg-card shadow-sm">
               <CardHeader className="pb-3">
                 <div className="flex items-center gap-2">
                   <HugeiconsIcon icon={Settings01Icon} className="size-4 text-primary" />
-                  <CardTitle className="text-sm font-semibold">Encode Settings</CardTitle>
+                  <CardTitle className="text-sm font-semibold">Settings</CardTitle>
                 </div>
-                <CardDescription className="text-xs">Optimized for Sony PSP hardware decoder</CardDescription>
+                <CardDescription className="text-xs">Adjust video and audio quality</CardDescription>
               </CardHeader>
               <CardContent className="flex flex-col gap-3.5 text-xs">
                 {/* Resolution */}
                 <div className="flex flex-col gap-1.5">
-                  <Label className="text-xs text-muted-foreground">Target Resolution</Label>
+                  <Label className="text-xs text-muted-foreground">Screen Size</Label>
                   <Select value={preset} onValueChange={(v) => { if (v) setPreset(v as PresetName) }}>
                     <SelectTrigger className="w-full h-8 text-xs">
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
                       <SelectGroup>
-                        <SelectItem value="go">480×272 Standard (PSP-1000/2000/3000/Go)</SelectItem>
-                        <SelectItem value="tv">720×480 High-Res (Ark-4 / TV-Out)</SelectItem>
+                        <SelectItem value="go">Standard (480×272) — All PSP models</SelectItem>
+                        <SelectItem value="tv">High Resolution (720×480) — TV Cable & ARK-4</SelectItem>
                       </SelectGroup>
                     </SelectContent>
                   </Select>
@@ -548,17 +523,17 @@ function ConverterPage() {
 
                 {/* Video Bitrate */}
                 <div className="flex flex-col gap-1.5">
-                  <Label className="text-xs text-muted-foreground">Video Bitrate</Label>
+                  <Label className="text-xs text-muted-foreground">Video Quality</Label>
                   <Select value={videoBitrate} onValueChange={(v) => { if (v) setVideoBitrate(v) }}>
                     <SelectTrigger className="w-full h-8 text-xs">
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
                       <SelectGroup>
-                        <SelectItem value="800000">800 kbps (Standard Balanced)</SelectItem>
-                        <SelectItem value="1200000">1200 kbps (High Quality)</SelectItem>
-                        <SelectItem value="1600000">1600 kbps (Max Ark-4)</SelectItem>
-                        <SelectItem value="550000">550 kbps (Anime / Compact)</SelectItem>
+                        <SelectItem value="800000">Balanced (Recommended)</SelectItem>
+                        <SelectItem value="1200000">High Quality</SelectItem>
+                        <SelectItem value="1600000">Best Quality (Larger file)</SelectItem>
+                        <SelectItem value="550000">Small File Size</SelectItem>
                       </SelectGroup>
                     </SelectContent>
                   </Select>
@@ -566,16 +541,16 @@ function ConverterPage() {
 
                 {/* Audio Bitrate */}
                 <div className="flex flex-col gap-1.5">
-                  <Label className="text-xs text-muted-foreground">Audio Bitrate (AAC-LC)</Label>
+                  <Label className="text-xs text-muted-foreground">Audio Quality</Label>
                   <Select value={audioBitrate} onValueChange={(v) => { if (v) setAudioBitrate(v) }}>
                     <SelectTrigger className="w-full h-8 text-xs">
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
                       <SelectGroup>
-                        <SelectItem value="128000">128 kbps (Standard)</SelectItem>
-                        <SelectItem value="96000">96 kbps (Voice / Compact)</SelectItem>
-                        <SelectItem value="160000">160 kbps (High Fidelity)</SelectItem>
+                        <SelectItem value="128000">Standard (Recommended)</SelectItem>
+                        <SelectItem value="96000">Compact (Podcasts & Speech)</SelectItem>
+                        <SelectItem value="160000">High Quality (Music)</SelectItem>
                       </SelectGroup>
                     </SelectContent>
                   </Select>
@@ -583,15 +558,15 @@ function ConverterPage() {
 
                 {/* LCD Shadow Boost */}
                 <div className="flex flex-col gap-1.5">
-                  <Label className="text-xs text-muted-foreground">Screen Tuning (Shadow Lift)</Label>
+                  <Label className="text-xs text-muted-foreground">Colors</Label>
                   <Select value={lcdBoost} onValueChange={(v) => { if (v) setLcdBoost(v) }}>
                     <SelectTrigger className="w-full h-8 text-xs">
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
                       <SelectGroup>
-                        <SelectItem value="off">Standard (Go / IPS Mod / Modern)</SelectItem>
-                        <SelectItem value="on">PSP-1000/2000 LCD Boost (+14% contrast)</SelectItem>
+                        <SelectItem value="off">Natural colors</SelectItem>
+                        <SelectItem value="on">Vibrant (Fixes dark scenes on older PSP-1000/2000)</SelectItem>
                       </SelectGroup>
                     </SelectContent>
                   </Select>
@@ -599,15 +574,15 @@ function ConverterPage() {
 
                 {/* Parallel Pipeline */}
                 <div className="flex flex-col gap-1.5">
-                  <Label className="text-xs text-muted-foreground">Pipeline Mode</Label>
+                  <Label className="text-xs text-muted-foreground">Speed</Label>
                   <Select value={pipelineMode} onValueChange={(v) => { if (v) setPipelineMode(v) }}>
                     <SelectTrigger className="w-full h-8 text-xs">
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
                       <SelectGroup>
-                        <SelectItem value="segmented">Turbo Segmented (5 Workers — 1000+ FPS)</SelectItem>
-                        <SelectItem value="single">Single Worker Direct</SelectItem>
+                        <SelectItem value="segmented">Fast (Multi-core acceleration)</SelectItem>
+                        <SelectItem value="single">Standard</SelectItem>
                       </SelectGroup>
                     </SelectContent>
                   </Select>
@@ -617,7 +592,7 @@ function ConverterPage() {
 
                 {/* Destination / Disk Stream */}
                 <div className="flex flex-col gap-2">
-                  <Label className="text-xs text-muted-foreground">Output Destination</Label>
+                  <Label className="text-xs text-muted-foreground">Where to Save</Label>
                   {dirName ? (
                     <div className="flex items-center justify-between rounded-xl bg-muted/40 p-2 border border-border">
                       <div className="flex items-center gap-2 truncate">
@@ -631,11 +606,11 @@ function ConverterPage() {
                   ) : (
                     <Button variant="outline" size="sm" onClick={chooseDirectory} className="w-full text-xs gap-1.5 border-dashed">
                       <HugeiconsIcon icon={Folder01Icon} className="size-3.5 text-primary" />
-                      Stream to Disk / Memory Stick
+                      Save directly to PSP Memory Stick
                     </Button>
                   )}
                   <span className="text-[11px] text-muted-foreground leading-snug">
-                    {dirName ? "Zero-RAM footprint: videos write directly to stick." : "Outputs will download through browser."}
+                    {dirName ? "Videos will save directly into this folder." : "Videos will download to your browser."}
                   </span>
                 </div>
               </CardContent>
@@ -672,7 +647,7 @@ function ConverterPage() {
               </div>
               <h3 className="font-heading text-sm font-medium">Drop video files here or click to browse</h3>
               <p className="mt-1 text-xs text-muted-foreground">
-                MP4, MKV, AVI, MOV, WEBM. Fast hardware transcode with dual .THM covers.
+                Supports MP4, MKV, AVI, MOV, WEBM. Includes cover art for your PSP.
               </p>
             </div>
 
@@ -681,7 +656,7 @@ function ConverterPage() {
               <div className="flex flex-wrap items-center justify-between gap-2 px-1">
                 <div className="flex items-center gap-2 text-xs text-muted-foreground">
                   <span>
-                    Queue: <strong className="text-foreground">{jobs.length}</strong> {jobs.length === 1 ? "video" : "videos"}
+                    <strong className="text-foreground">{jobs.length}</strong> {jobs.length === 1 ? "video" : "videos"}
                   </span>
                   {convertingCount > 0 && (
                     <Badge variant="secondary" className="text-[10px] animate-pulse">
@@ -694,12 +669,12 @@ function ConverterPage() {
                   {queuedCount >= 2 && (
                     <Button variant="outline" size="sm" onClick={mergeQueuedJobs} className="text-xs gap-1.5">
                       <HugeiconsIcon icon={Layers01Icon} className="size-3.5 text-primary" />
-                      Merge into Marathon ({queuedCount} eps)
+                      Combine into one video ({queuedCount} parts)
                     </Button>
                   )}
                   <Button variant="ghost" size="sm" onClick={clearAllJobs} className="text-xs text-muted-foreground hover:text-destructive gap-1.5">
                     <HugeiconsIcon icon={Delete02Icon} className="size-3.5" />
-                    Clear
+                    Clear list
                   </Button>
                 </div>
               </div>
@@ -723,19 +698,19 @@ function ConverterPage() {
                           }}
                           disabled={job.status === "converting" || job.status === "done"}
                           className="h-7 text-xs font-medium font-sans max-w-sm"
-                          placeholder="PSP Title"
+                          placeholder="Title"
                         />
                         {job.isMerge && (
                           <Badge variant="secondary" className="text-[10px] shrink-0">
-                            Marathon
+                            Combined
                           </Badge>
                         )}
                       </div>
 
                       <div className="flex items-center gap-1.5 shrink-0">
                         {job.profileBadge && (
-                          <Badge variant="default" className="text-[10px] font-mono bg-emerald-600/90 text-white">
-                            {job.profileBadge.text}
+                          <Badge variant="default" className="text-[10px] bg-emerald-600/90 text-white font-medium">
+                            PSP Ready
                           </Badge>
                         )}
                         <Badge
@@ -748,9 +723,9 @@ function ConverterPage() {
                                   ? "destructive"
                                   : "outline"
                           }
-                          className="text-[10px] uppercase font-mono"
+                          className="text-[10px] capitalize font-medium"
                         >
-                          {job.status}
+                          {job.status === "converting" ? "Converting…" : job.status === "done" ? "Ready" : job.status}
                         </Badge>
                       </div>
                     </div>
@@ -793,9 +768,11 @@ function ConverterPage() {
                     {/* Progress Bar & Note */}
                     <div className="flex flex-col gap-1.5">
                       <Progress value={Math.round(job.progress * 100)} className="h-1.5 w-full" />
-                      <div className="flex items-center justify-between text-[11px] text-muted-foreground font-mono">
+                      <div className="flex items-center justify-between text-[11px] text-muted-foreground">
                         <span className="truncate">{job.note}</span>
-                        {job.stats?.fps ? <span>{job.stats.fps.toFixed(0)} FPS</span> : null}
+                        {job.stats?.fps ? (
+                          <span className="font-mono">{job.stats.fps.toFixed(0)} FPS</span>
+                        ) : null}
                       </div>
                     </div>
 
@@ -809,25 +786,32 @@ function ConverterPage() {
                             className="inline-flex items-center gap-1.5 rounded-full bg-primary px-3 py-1 text-xs font-medium text-primary-foreground hover:bg-primary/90 transition-colors"
                           >
                             <HugeiconsIcon icon={Download01Icon} className="size-3.5" />
-                            Download MP4
+                            Download Video
                           </a>
                         )}
 
                         {job.thmUrl && (
-                          <a
-                            href={job.thmUrl}
-                            download={(job.outName || "video.mp4").replace(/\.mp4$/i, ".thm")}
-                            className="inline-flex items-center gap-1.5 rounded-full border border-border bg-card px-3 py-1 text-xs font-medium hover:bg-muted transition-colors"
-                          >
-                            <HugeiconsIcon icon={Image01Icon} className="size-3.5 text-muted-foreground" />
-                            .THM Cover
-                          </a>
+                          <Tooltip>
+                            <TooltipTrigger render={
+                              <a
+                                href={job.thmUrl}
+                                download={(job.outName || "video.mp4").replace(/\.mp4$/i, ".thm")}
+                                className="inline-flex items-center gap-1.5 rounded-full border border-border bg-card px-3 py-1 text-xs font-medium hover:bg-muted transition-colors"
+                              >
+                                <HugeiconsIcon icon={Image01Icon} className="size-3.5 text-muted-foreground" />
+                                Cover Art (.THM)
+                              </a>
+                            } />
+                            <TooltipContent>
+                              Put this file in the same folder as the video on your PSP to see the thumbnail
+                            </TooltipContent>
+                          </Tooltip>
                         )}
 
                         {job.savedDirect && (
-                          <span className="inline-flex items-center gap-1 text-[11px] text-emerald-500 font-mono">
+                          <span className="inline-flex items-center gap-1 text-[11px] text-emerald-500 font-medium">
                             <HugeiconsIcon icon={CheckmarkCircle02Icon} className="size-3.5" />
-                            Saved to Memory Stick
+                            Saved directly to PSP
                           </span>
                         )}
                       </div>
