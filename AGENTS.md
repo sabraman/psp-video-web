@@ -1,98 +1,112 @@
-# PSP Video Web Converter — AI Agent Guide
+# AGENTS.md
 
-Comprehensive guide for AI agents and contributors working on the `psp-video-web` codebase.
+psp-video-web is an in-browser video transcoder and USB storage manager engineered for the Sony PlayStation Portable (PSP 1000, 2000, 3000, PSP Go, and Street). It runs 100% client-side via WebCodecs and MediaBunny, paired with a local development server plugin that acts as a zero-copy USB bridge to connected PSP FAT32 partitions.
 
----
-
-## 📌 Project Overview & Purpose
-
-`psp-video-web` is a zero-server, high-performance in-browser video converter specifically engineered for the **Sony PlayStation Portable (PSP 1000 / 2000 / 3000 / Go / Street)**. It runs 100% client-side using WebCodecs and MediaBunny, paired with a local USB bridge for automatic PSP volume detection, direct file streaming, conflict resolution, and file management.
+When contributing or generating code for this repository, preserve the core constraints and follow the patterns documented below.
 
 ---
 
-## 🔒 Hard Architectural Constraints (Non-Negotiable)
+## Core Pillars
 
-When writing or modifying any encoding, container, or file-writing code, the following constraints must strictly be preserved:
+### 1. 100% Client-Side Transcoding
 
-1. **Video Codec & AVC Level**:
-   - **H.264 / AVC Constrained Baseline Profile** (`avc1.42E01E`).
-   - Profile/Level MUST NOT exceed **Level 3.0** (`0x1E`). Higher profiles (Main, High) or higher levels (3.1+) fail on PSP hardware with playback error `80020001` or black screens.
-   - Native PSP resolution: **480×272**.
-   - TV-out resolution (FW ≥ 3.30): **720×480** (Baseline ≤ L3.0).
-   - Framerate: strictly **≤ 29.97 fps** (frames downsampled using pre-transform skipping to prevent decoder crash).
+Video files never leave the user's computer. All demuxing, video frame decoding, spatial scaling, canvas composition, subtitle burn-in, audio resynthesis or passthrough, and MP4 muxing happen in browser Web Workers. Never introduce remote API dependencies or backend conversion services for media processing.
 
-2. **Audio Codec**:
-   - **AAC-LC** (`mp4a.40.2`).
-   - Sample rate: **44.1 kHz** or **48.0 kHz**.
-   - Channels: mono or stereo (≤ 2 channels). Multi-channel audio (5.1, 7.1) must be downmixed.
-   - Remuxing: If source audio is already AAC-LC stereo/mono at 44.1/48 kHz, pass packets directly without re-encoding (`EncodedAudioPacketSource`).
+### 2. Strict Sony Hardware Compliance
 
-3. **Container**:
-   - Standard ISO Base Media File (`.mp4`), non-fragmented.
-   - FastStart MUST be enabled (`fastStart: "in-memory"` in MediaBunny) so that `moov` atom is placed before `mdat`.
+The PSP hardware media engine (Media Engine chip + AVC decoder) is rigid. Files that play on modern desktop players will crash the PSP or display `80020001 / Unsupported Data` if any specification is exceeded:
 
-4. **Cover Art (`.thm`)**:
-   - 160×120 baseline JPEG image placed in `/VIDEO` next to the `.mp4` file with identical basename (`<title>.thm`).
+- **Codec**: H.264 / AVC Constrained Baseline Profile (`avc1.42E01E`). Profile must be Baseline; Level must be `<= 3.0` (`0x1E`).
+- **Resolution**: Native display is strictly `480x272`. TV-out profile allows up to `720x480` (FW >= 3.30).
+- **Framerate**: Maximum `29.97 fps` (`30000/1001`). Frame rates above 30 fps crash playback.
+- **Audio**: AAC-LC (`mp4a.40.2`), mono or stereo (`<= 2` channels), `44.1 kHz` or `48.0 kHz`.
+- **Container**: Non-fragmented MP4 with FastStart (`moov` atom placed before `mdat`).
+- **Thumbnail**: 160x120 baseline JPEG saved as `<basename>.thm` in the same directory.
 
-5. **Resource & Memory Management**:
-   - Every `Input` from MediaBunny must be wrapped in `try { ... } finally { input.dispose(); }`.
-   - On completion of direct-to-PSP transfers, release underlying in-memory `ArrayBuffer` references from React state to allow Garbage Collection.
-   - Any created `URL.createObjectURL()` must have a paired `URL.revokeObjectURL()`.
+### 3. Memory Lifecycle Discipline
+
+Video transcoding processes gigabytes of raw frame data in memory. A single leaked `VideoFrame` or unclosed `Input` will trigger browser tab crashes (OOM) or GPU pipeline stall.
+
+- Always close every `VideoFrame` immediately after drawing or snapshotting.
+- Wrap every MediaBunny `Input` in `try ... finally { input.dispose(); }`.
+- In React components, dereference large `ArrayBuffer` payloads from state as soon as jobs finish or write to disk completes.
+- Paired `URL.revokeObjectURL()` calls must exist for every `URL.createObjectURL()`.
 
 ---
 
-## 🗂️ Codebase Architecture
+## Glossary
+
+- **you**: The agent reading this guide and modifying psp-video-web.
+- **maintainer**: The maintainers of psp-video-web.
+- **user**: The person using the application to convert videos and transfer them to a PSP.
+- **bridge**: The local Vite development server plugin (`src/server/psp-plugin.ts`) providing `/api/psp/*` filesystem access to mounted `/Volumes` disks.
+- **worker**: The Web Worker running inside `public/worker.js` (compiled from `src/worker.ts`), executing isolated conversion pipelines.
+- **job**: A single transcoding or remux task representing an input file, conversion options, progress metrics, and output artifacts.
+- **partition**: A mounted PSP storage volume (e.g. `NO NAME 1` for PSP Go internal 16 GB eMMC, `NO NAME` for Memory Stick Micro / PRO Duo).
+
+---
+
+## The Three Ways to Hurt Yourself
+
+1. **Emitting Main or High Profile H.264**:
+   WebCodecs encoders default to Main or High profiles unless explicitly configured with `avc1.42E01E`. The output MP4 must always be verified by parsing the `avcC` box in the MP4 header. Never remove the profile check or assume browser defaults are safe.
+2. **Leaking Hardware VideoFrames and Canvas Contexts**:
+   Allocating an `OffscreenCanvas` per frame or forgetting to call `frame.close()` will exhaust GPU textures on Apple Silicon / Windows within seconds. Use persistent pooled canvases and enforce synchronous frame closure in decode pump loops.
+3. **Leaving Orphan macOS Metadata on FAT32**:
+   Writing to FAT32 volumes on macOS creates hidden `._*` dot-underscore resource fork files. When renaming or deleting PSP videos via the bridge, always clean up corresponding `._*` files, or the PSP XMB menu will display corrupted ghost items.
+
+---
+
+## Codebase Map
 
 ```
 psp-video-web/
-├── .agents/skills/          # Installed agent skills (deploy-to-vercel, shadcn)
 ├── src/
 │   ├── components/
-│   │   ├── PspStorageManager.tsx # Full-featured PSP disk manager dialog
-│   │   └── ui/              # Base UI & shadcn primitives (button, dialog, select, etc.)
+│   │   ├── PspStorageManager.tsx # PSP filesystem browser, capacity gauge, rename/delete modal
+│   │   └── ui/                   # Base UI and shadcn components (dialog, select, button, etc.)
 │   ├── routes/
-│   │   ├── __root.tsx       # Root layout & theme provider
-│   │   └── index.tsx        # Main converter dashboard & job queue
+│   │   ├── __root.tsx            # TanStack Start root layout and providers
+│   │   └── index.tsx             # Main dashboard, conversion queue, partition card
 │   ├── server/
-│   │   └── psp-plugin.ts    # Vite plugin providing /api/psp/* endpoints
-│   ├── app.ts               # Minimal UI worker controller fallback
-│   ├── convert.ts           # MediaBunny transcoding engine, avcC parser, segmented muxer
-│   ├── psp.ts               # Client-side PSP API client & auto-detection utilities
-│   ├── styles.css           # Tailwind CSS v4 design system
-│   └── worker.ts            # Web Worker for isolated transcoding execution
-├── public/                  # Public assets, test clips, and compiled worker.js
-├── vite.config.ts           # Vite configuration with TanStack Start & PSP plugin
+│   │   └── psp-plugin.ts         # Vite server plugin with /api/psp/* endpoints
+│   ├── convert.ts                # MediaBunny conversion engine, avcC validator, remuxer
+│   ├── psp.ts                    # Client-side bridge API client and disk formatting utilities
+│   ├── router.tsx                # TanStack Router configuration
+│   ├── styles.css                # Tailwind CSS v4 design system
+│   └── worker.ts                 # Transcoding Web Worker
+├── public/
+│   ├── sample.mp4                # Tiny test clip for verification
+│   └── worker.js                 # Compiled worker bundle
 ├── package.json
-└── tsconfig.json
+├── tsconfig.json
+└── vite.config.ts
 ```
 
 ---
 
-## 🛠️ Key APIs (`/api/psp/*`)
+## Development Workflow
 
-- `GET /api/psp/status`: Probes mounted system volumes (`/Volumes`) for PSP directories (`/PSP`, `/VIDEO`, `/ISO`). Returns detected partitions, total space, and free space.
-- `GET /api/psp/files?dir=...`: Lists `.mp4` video files on the partition with file sizes, timestamps, and `.thm` thumbnail existence.
-- `GET /api/psp/thumb?dir=...&file=...`: Streams raw 160×120 JPEG thumbnail for browser rendering with HTTP caching.
-- `POST /api/psp/save`: Streams converted video buffer and thumbnail directly to the PSP volume.
-- `POST /api/psp/rename`: Performs instant zero-copy file renaming on disk for both `.mp4` and `.thm`.
-- `POST /api/psp/delete`: Deletes `.mp4`, paired `.thm`, and macOS `._*` dot-underscore metadata files.
+### Commands
 
----
+```bash
+bun install               # Install dependencies
+bun run dev               # Start dev server on port 3005 with USB bridge
+bun run build             # Build worker bundle and production SSR/client output
+bun run preview           # Preview built production distribution
+bun run lint              # Oxlint check
+bun run format            # Oxfmt format files
+bun run format:check      # Oxfmt check without writing
+bun run typecheck         # TypeScript typecheck (tsc --noEmit)
+```
 
-## 🧪 Development & Verification Workflow
+### Verification Rules
 
-1. **Dev Server**:
-   ```bash
-   bun run dev
-   ```
-2. **Linting & Formatting**:
-   ```bash
-   bun run lint          # oxlint
-   bun run format        # oxfmt
-   bun run format:check  # oxfmt --check
-   bun run typecheck     # tsc --noEmit
-   ```
-3. **Building**:
-   ```bash
-   bun run build         # Builds worker & Vite SSR + client bundles
-   ```
+- Before opening a pull request or finishing a turn:
+  1. Run `bun run lint` (must pass with 0 errors and 0 warnings).
+  2. Run `bun run format:check` (all files must be formatted cleanly).
+  3. Run `bun run typecheck` (must pass cleanly).
+- When modifying UI components:
+  - Use Base UI primitives and Tailwind CSS v4 utility classes.
+  - Do not add arbitrary external UI libraries or heavy icon packs. Use `@hugeicons/react`.
+  - Avoid inline CSS styles except where dynamic values (percentages, dimensions) require them.
