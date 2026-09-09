@@ -1,52 +1,144 @@
-# psp-video-web
+# 🎮 PSP Video Converter Web
 
-In-browser PSP Go video converter. Drag in videos, get PSP-ready MP4s — **100% client-side**, files never leave the device.
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Built with Bun](https://img.shields.io/badge/Runtime-Bun-f472b6.svg)](https://bun.sh)
+[![Powered by MediaBunny](https://img.shields.io/badge/Powered%20by-MediaBunny-8b5cf6.svg)](https://github.com/Vanilagy/mediabunny)
+[![Framework: TanStack Start](https://img.shields.io/badge/Framework-TanStack%20Start-0ea5e9.svg)](https://tanstack.com/start)
+[![Tailwind CSS v4](https://img.shields.io/badge/Tailwind-v4-38bdf8.svg)](https://tailwindcss.com)
+[![Code Quality: Oxlint & Oxfmt](https://img.shields.io/badge/Linter-Oxlint%20%26%20Oxfmt-orange.svg)](https://oxc.rs)
 
-Built with **Bun** (runtime, bundler, static server) + **MediaBunny** (WebCodecs-powered decode/encode, no ffmpeg needed).
+> High-performance, 100% in-browser video converter built for the **Sony PlayStation Portable** (PSP 1000, 2000, 3000, PSP Go, and Street).
+> Drag and drop modern videos (MKV, MP4, AVI, MOV, WEBM) and get PSP-ready MP4s with matching `.thm` cover art, saved **directly to your connected PSP over USB** — zero server uploads required.
 
-Architecture: `src/convert.ts` holds all conversion logic, `src/worker.ts` runs
-it in a **Web Worker pool** (up to 4, one file per worker — true multi-core
-batch encodes, zero main-thread jank, measured 0 ms event-loop lag mid-encode),
-`src/app.ts` is UI only. Quality is constant-quality quantizer (CRF-like:
-Q28/Q25/Q22) with a source-capped bitrate fallback.
+---
 
-## Run it
+## ✨ Features
 
-```bash
-bun install
-bun dev        # http://localhost:3000 (PORT=8137 bun dev for a custom port)
+- **🚀 100% Client-Side Transcoding**: Powered by **WebCodecs** and **MediaBunny**. Your videos never touch a remote server; all decoding, scaling, subtitle rendering, and encoding happen directly in your browser.
+- **⚡ Hardware Accelerated & Multi-Core**:
+  - Leverages Apple Silicon (VideoToolbox), Intel QuickSync, and NVIDIA NVENC hardware encoders.
+  - Multi-threaded segmented pipeline (`SegmentedMuxer`) encodes video chunks in parallel across CPU performance and efficiency cores.
+  - AAC-LC audio remuxing: When audio is already compliant, it bypasses re-encoding for instant remux speeds.
+- **🔌 Automatic PSP USB Detection**:
+  - Automatically identifies connected PSP devices over USB (including multi-partition setups like PSP Go internal 16 GB eMMC + M2 Memory Stick).
+  - Streams converted videos directly to the PSP's `/VIDEO` directory with zero manual copying.
+- **🛡️ Intelligent Anti-Duplication**:
+  - Scans PSP storage before encoding starts.
+  - Configurable conflict actions for existing titles: **Skip**, **Replace existing**, or **Keep both** (auto-versioned).
+- **📁 Built-in PSP Storage Manager**:
+  - Visual storage gauge showing real-time disk space usage and free capacity.
+  - Browse all videos stored on the PSP with live `.thm` cover art thumbnails.
+  - Instant live search and multi-criteria sorting (Newest, Oldest, Largest, Smallest, Name).
+  - Zero-copy inline renaming and two-step confirmation deletion.
+- **🖼️ Automatic Cover Art Generation**:
+  - Automatically captures and scales a 160×120 JPEG `.thm` thumbnail directly embedded for the PSP XMB video browser.
+- **💬 Subtitle Burning**:
+  - Supports `.srt` and `.vtt` subtitles baked directly onto the video stream with auto-scaling typography.
+- **🎨 Modern UI**:
+  - Built with **TanStack Start**, **Tailwind CSS v4**, **Base UI / shadcn**, and **Hugeicons**.
+
+---
+
+## 🎯 PSP Compatibility Specifications
+
+Every output MP4 is strictly verified against Sony's hardware playback constraints:
+
+| Specification   | Hardware Limit / Target             | Converter Implementation                                             |
+| :-------------- | :---------------------------------- | :------------------------------------------------------------------- |
+| **Video Codec** | H.264 / AVC                         | Forced Constrained Baseline Profile (`avc1.42E01E`)                  |
+| **AVC Level**   | Level 3.0 or below                  | Level 3.0 strictly enforced via direct MP4 `avcC` box validation     |
+| **Resolution**  | 480×272 (Native) / 720×480 (TV-out) | Auto-fitted with letterboxing or integer aspect scaling              |
+| **Framerate**   | ≤ 29.97 fps (30000/1001)            | Pre-transform skipping for high-fps (e.g. 60fps) sources             |
+| **Audio Codec** | AAC-LC (`mp4a.40.2`)                | 44.1 kHz or 48 kHz stereo / mono, 64–192 kbps                        |
+| **Container**   | ISO Base Media File (MP4)           | Non-fragmented MP4 with faststart (`moov` atom placed before `mdat`) |
+| **Thumbnail**   | 160×120 JPEG                        | Created as `<name>.thm` alongside `<name>.mp4`                       |
+
+---
+
+## 🏗️ Architecture
+
+```mermaid
+graph TD
+    A["Video Input (MP4, MKV, AVI, etc.)"] --> B["Probe & Compatibility Check"]
+    B --> C{"Audio Compliant?"}
+    C -->|Yes| D["Audio Passthrough (Remux)"]
+    C -->|No| E["AAC-LC Software / HW Encoder"]
+    B --> F["Frame Pipeline & Resizer (OffscreenCanvas)"]
+    F --> G["Subtitles (.srt / .vtt) Overlay"]
+    G --> H["WebCodecs H.264 Encoder (Baseline L3.0)"]
+    H --> I["Segmented Muxer (MediaBunny)"]
+    D --> I
+    E --> I
+    I --> J["Verified PSP MP4 + .thm Art"]
+    J --> K{"PSP USB Connected?"}
+    K -->|Yes| L["Direct Zero-Copy Stream to /VIDEO"]
+    K -->|No| M["Local Folder Save / Browser Download"]
 ```
 
-`bun dev` watches `server.ts` and re-bundles `src/app.ts → public/app.js` on every start.
+---
 
-## What it produces
+## 🚀 Getting Started
 
-Same recipe as the CLI (`../psp-video-optimise-cli`): MP4 + faststart, **H.264 Constrained Baseline ≤ L3.0**, 480×272 (or 720×480 TV preset), ≤29.97fps, AAC-LC stereo.
+### Prerequisites
 
-Three things the web version does that most converters don't:
+- [Bun](https://bun.sh) (v1.1+) or Node.js (v20+)
+- Modern Chromium or WebCodecs-compatible browser (Chrome, Edge, Brave, Arc, Opera)
 
-1. **Forces Baseline via codec string** (`avc1.42E01E`) through a manual
-   `VideoSampleSink → VideoSampleSource` pipeline — `Conversion.init` has no
-   `fullCodecString` option and browsers otherwise emit Main/High (verified:
-   headless Chrome defaulted to High L2.1, unplayable on PSP).
-2. **Verifies every output** by parsing the MP4's `avcC` box and badging the
-   real profile/level: green Baseline, amber Main, red High.
-3. **Auto encoder strategy**: hardware first (VideoToolbox on Apple Silicon),
-   re-encode in software if the profile isn't PSP-safe. Plus Software-only
-   and Turbo (`realtime` latency) modes.
-4. **Never upscales bitrate**: target is capped at the source's own bitrate,
-   so a squeezed 378 MB movie can't come out as 449 MB.
+### Installation
 
-## Speed (fastest → slowest)
+```bash
+# Clone the repository
+git clone https://github.com/sabraman/psp-video-web.git
+cd psp-video-web
 
-- **Remux**: already-PSP-native input (Baseline/Main ≤ L3.0, ≤480×272,
-  ≤30fps, AAC-LC) is packet-copied, not re-encoded — instant, zero loss.
-- **Hardware** (Auto default): VideoToolbox on Apple Silicon.
-- **Turbo**: hardware + `realtime` latency, slightly bigger files.
-- **Software**: slowest, always max-compatible fallback.
+# Install dependencies
+bun install
+```
 
-Every job reports its method and phase timing
-(`remuxed in 0.0s`, `hardware in 0.5s (probe 0.0s)`), so you can see where
-time actually goes on your machine instead of guessing.
+### Running Locally
 
-`public/sample.mp4` is a tiny generated test clip for trying it out.
+```bash
+# Start Vite development server with PSP USB detector
+bun run dev
+```
+
+Open [http://localhost:3005](http://localhost:3005) in your browser.
+
+Connect your PSP via USB, set the USB Connection mode in the PSP XMB menu, and the converter will automatically detect your device partitions and free storage!
+
+### Building for Production
+
+```bash
+# Build worker and client bundle
+bun run build
+
+# Preview production build
+bun run preview
+```
+
+### Code Quality
+
+```bash
+# Typecheck
+bun run typecheck
+
+# Lint with oxlint
+bun run lint
+
+# Format with oxfmt
+bun run format
+bun run format:check
+```
+
+---
+
+## 🎮 PSP Tested Devices
+
+- **PSP Go (PSP-N1000)**: Internal 16GB eMMC (`NO NAME 1`) and M2 Memory Stick Micro (`NO NAME`).
+- **PSP 1000 / 2000 / 3000 / Street (E1000)**: Memory Stick PRO Duo partitions.
+
+---
+
+## 📄 License
+
+MIT © [sabraman](https://github.com/sabraman)

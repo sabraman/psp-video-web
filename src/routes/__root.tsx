@@ -8,11 +8,13 @@ export const Route = createRootRoute({
       { charSet: "utf-8" },
       { name: "viewport", content: "width=device-width, initial-scale=1" },
       { title: "PSP Video Converter — WebCodecs & MediaBunny" },
-      { name: "description", content: "Ultra-fast in-browser PSP Go/1000/2000/3000 video encoder with WebCodecs hardware acceleration." },
+      {
+        name: "description",
+        content:
+          "Ultra-fast in-browser PSP Go/1000/2000/3000 video encoder with WebCodecs hardware acceleration.",
+      },
     ],
-    links: [
-      { rel: "stylesheet", href: appCss },
-    ],
+    links: [{ rel: "stylesheet", href: appCss }],
   }),
   notFoundComponent: () => (
     <main className="container mx-auto flex flex-col items-center justify-center min-h-[60vh] gap-4 p-4 text-center">

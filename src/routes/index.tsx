@@ -1,12 +1,20 @@
 import * as React from "react"
 import { createFileRoute } from "@tanstack/react-router"
-import { Card, CardHeader, CardTitle, CardDescription, CardContent } from "@/components/ui/card"
+import { Card } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import { Progress } from "@/components/ui/progress"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { Select, SelectTrigger, SelectValue, SelectContent, SelectGroup, SelectItem } from "@/components/ui/select"
+import { PspStorageManager } from "@/components/PspStorageManager"
+import {
+  Select,
+  SelectTrigger,
+  SelectValue,
+  SelectContent,
+  SelectGroup,
+  SelectItem,
+} from "@/components/ui/select"
 import { Separator } from "@/components/ui/separator"
 import { TooltipProvider, Tooltip, TooltipTrigger, TooltipContent } from "@/components/ui/tooltip"
 import { toast } from "sonner"
@@ -16,14 +24,32 @@ import {
   Folder01Icon,
   Delete02Icon,
   Film01Icon,
-  Settings01Icon,
-  CheckmarkCircle02Icon,
   Layers01Icon,
   Image01Icon,
   RefreshIcon,
   Shield01Icon,
+  ClosedCaptionIcon,
+  Edit02Icon,
+  UsbConnected01Icon,
 } from "@hugeicons/core-free-icons"
-import { cleanPspTitle, fmtTime, type ConvertSettings, type ProgressStats, type PresetName } from "@/convert"
+import {
+  formatBytes,
+  sanitizePspFilename,
+  saveBuffersToPspApi,
+  listPspFiles,
+  type DetectedPspDevice,
+  type DuplicateAction,
+  type PspFileInfo,
+} from "@/psp"
+import {
+  cleanPspTitle,
+  fmtTime,
+  type ConvertSettings,
+  type ProgressStats,
+  type PresetName,
+  parseSubtitles,
+  type SubtitleCue,
+} from "@/convert"
 
 export const Route = createFileRoute("/")({
   component: ConverterPage,
@@ -35,6 +61,12 @@ export interface JobAudioTrack {
   language?: string
   codec?: string
 }
+
+/**
+ * Sanitize a user-facing title into safe FAT32 filenames for PSP Memory Stick (.mp4 and .thm).
+ * Preserves unicode characters in all languages (Cyrillic, Japanese, etc.)
+ * while stripping strictly illegal FAT32 characters (/ \ : * ? " < > |).
+ */
 
 export interface JobItem {
   id: number
@@ -49,7 +81,8 @@ export interface JobItem {
   dims?: string
   outSize?: number
   outName?: string
-  profileBadge?: { text: string; cls: string }
+  savedOutName?: string
+  savedToPspPath?: string
   buffer?: ArrayBuffer
   thmBuffer?: ArrayBuffer
   url?: string
@@ -60,6 +93,11 @@ export interface JobItem {
   duration?: number
   retryCount?: number
   forceSafeMode?: boolean
+  subtitleFileName?: string
+  subtitleCues?: SubtitleCue[]
+  duplicateOnPsp?: boolean
+  duplicateAction?: DuplicateAction
+  storageWarning?: string
 }
 
 interface WorkerSlot {
@@ -107,6 +145,8 @@ function loadDirectoryHandle(): Promise<FileSystemDirectoryHandle | null> {
   })
 }
 
+// formatBytes imported from ~/psp
+
 function clearSavedDirectoryHandle(): Promise<void> {
   return new Promise((resolve) => {
     try {
@@ -136,7 +176,30 @@ function ConverterPage() {
   const [lcdBoost, setLcdBoost] = React.useState<string>("off")
   const [pipelineMode, setPipelineMode] = React.useState<string>("segmented")
 
-  // Disk streaming / PSP memory stick folder
+  // Auto-detected PSP devices via local USB bridge
+  const [detectedDevices, setDetectedDevices] = React.useState<DetectedPspDevice[]>([])
+  const [selectedDeviceId, setSelectedDeviceId] = React.useState<string>("")
+  const [autoSaveToPsp, setAutoSaveToPsp] = React.useState<boolean>(true)
+  const [storageManagerOpen, setStorageManagerOpen] = React.useState<boolean>(false)
+  const [pspFiles, setPspFiles] = React.useState<PspFileInfo[]>([])
+  const pspFilesRef = React.useRef<PspFileInfo[]>([])
+  pspFilesRef.current = pspFiles
+
+  const refreshPspFiles = React.useCallback(async (videoPath?: string) => {
+    const path = videoPath || selectedPspDeviceRef.current?.videoPath
+    if (!path) {
+      setPspFiles([])
+      return []
+    }
+    const files = await listPspFiles(path)
+    setPspFiles(files)
+    return files
+  }, [])
+  const selectedPspDevice = React.useMemo(() => {
+    return detectedDevices.find((d) => d.id === selectedDeviceId) || detectedDevices[0] || null
+  }, [detectedDevices, selectedDeviceId])
+
+  // Disk streaming / manual folder
   const [dirHandle, setDirHandle] = React.useState<FileSystemDirectoryHandle | null>(null)
   const [dirName, setDirName] = React.useState<string | null>(null)
 
@@ -149,6 +212,52 @@ function ConverterPage() {
   const poolRef = React.useRef<WorkerSlot[]>([])
   const dirHandleRef = React.useRef<FileSystemDirectoryHandle | null>(null)
   dirHandleRef.current = dirHandle
+
+  const selectedPspDeviceRef = React.useRef<DetectedPspDevice | null>(null)
+  selectedPspDeviceRef.current = selectedPspDevice
+  const autoSaveToPspRef = React.useRef<boolean>(true)
+  autoSaveToPspRef.current = autoSaveToPsp
+  const selectedDeviceIdRef = React.useRef<string>(selectedDeviceId)
+  selectedDeviceIdRef.current = selectedDeviceId
+
+  // Poll for connected PSP devices over USB
+  const refreshPspStatus = React.useCallback(async () => {
+    try {
+      const res = await fetch("/api/psp/status")
+      if (!res.ok) return
+      const data = (await res.json()) as { connected: boolean; devices: DetectedPspDevice[] }
+      if (data.connected && data.devices?.length > 0) {
+        setDetectedDevices(data.devices)
+        let targetDevId = selectedDeviceIdRef.current
+        if (!targetDevId || !data.devices.some((d) => d.id === targetDevId)) {
+          const rec = data.devices.find((d) => d.isRecommended) || data.devices[0]
+          targetDevId = rec.id
+          setSelectedDeviceId(rec.id)
+        }
+        const targetDev = data.devices.find((d) => d.id === targetDevId) || data.devices[0]
+        if (targetDev?.videoPath) {
+          const files = await listPspFiles(targetDev.videoPath)
+          setPspFiles(files)
+        }
+      } else {
+        setDetectedDevices([])
+        setSelectedDeviceId("")
+        setPspFiles([])
+      }
+    } catch {}
+  }, [])
+
+  React.useEffect(() => {
+    void refreshPspStatus()
+    const interval = setInterval(refreshPspStatus, 3000)
+    const handleFocus = () => void refreshPspStatus()
+    window.addEventListener("focus", handleFocus)
+
+    return () => {
+      clearInterval(interval)
+      window.removeEventListener("focus", handleFocus)
+    }
+  }, [refreshPspStatus])
 
   // Restore settings and directory handle from storage on mount
   React.useEffect(() => {
@@ -233,7 +342,11 @@ function ConverterPage() {
       for (const slot of pool) {
         slot.worker?.terminate()
       }
+      for (const j of jobsRef.current) {
+        cleanupJobUrls(j)
+      }
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   const spawnWorker = (slot: WorkerSlot) => {
@@ -335,15 +448,41 @@ function ConverterPage() {
     }
 
     if (msg.type === "done" && msg.buffer) {
-      const rawStem = job.customTitle || job.file.name.replace(/\.[^.]+$/, "") || "video"
-      const cleanStem = rawStem.replace(/[^\w\s.-]/g, "").trim().replace(/\s+/g, "_")
-      const outName = `${cleanStem}.mp4`
-      const thmName = `${cleanStem}.thm`
+      let { outName, thmName } = sanitizePspFilename(job?.customTitle || job?.file.name || "video")
 
       let savedDirect = false
+      let savedToPspPath: string | undefined
       let url: string | undefined
       let thmUrl: string | undefined
 
+      // 1. Auto-detected PSP over USB
+      if (autoSaveToPspRef.current && selectedPspDeviceRef.current) {
+        const pspDev = selectedPspDeviceRef.current
+        const saveRes = await saveBuffersToPspApi(
+          pspDev.videoPath,
+          outName,
+          msg.buffer,
+          thmName,
+          msg.thmBuffer,
+          undefined,
+          job?.duplicateAction || "overwrite"
+        )
+        if (saveRes.success) {
+          savedDirect = true
+          savedToPspPath = pspDev.videoPath
+          if (saveRes.skipped) {
+            toast.info(`Skipped saving "${outName}" (already on PSP)`)
+          } else {
+            if (saveRes.filename && saveRes.filename !== outName) {
+              outName = saveRes.filename
+            }
+            toast.success(`Saved directly to PSP: "${outName}"`)
+          }
+          void refreshPspFiles(pspDev.videoPath)
+        }
+      }
+
+      // 2. Manual DirectoryHandle fallback
       const currentDir = dirHandleRef.current
       if (currentDir) {
         try {
@@ -383,21 +522,35 @@ function ConverterPage() {
             status: "done",
             progress: 1,
             note: "Ready",
-            buffer: msg.buffer,
-            thmBuffer: msg.thmBuffer,
+            buffer: savedDirect ? undefined : msg.buffer,
+            thmBuffer: savedDirect ? undefined : msg.thmBuffer,
             outName,
+            savedOutName: savedDirect ? outName : undefined,
+            savedToPspPath,
             url,
             thmUrl,
             savedDirect,
             dims: msg.dims,
             outSize: msg.outSize,
-            profileBadge: {
-              text: "PSP Ready",
-              cls: "green",
-            },
           }
         })
       )
+      const rj = jobsRef.current.find((j) => j.id === msg.id)
+      if (rj) {
+        rj.status = "done"
+        rj.progress = 1
+        rj.note = "Ready"
+        rj.buffer = savedDirect ? undefined : msg.buffer
+        rj.thmBuffer = savedDirect ? undefined : msg.thmBuffer
+        rj.outName = outName
+        rj.savedOutName = savedDirect ? outName : undefined
+        rj.savedToPspPath = savedToPspPath
+        rj.url = url
+        rj.thmUrl = thmUrl
+        rj.savedDirect = savedDirect
+        rj.dims = msg.dims
+        rj.outSize = msg.outSize
+      }
       freeSlot(slot)
       return
     }
@@ -424,6 +577,29 @@ function ConverterPage() {
     while (true) {
       const nextJob = jobsRef.current.find((j) => j.status === "queued")
       if (!nextJob) break
+
+      if (nextJob.duplicateOnPsp && nextJob.duplicateAction === "skip") {
+        nextJob.status = "done"
+        nextJob.progress = 1
+        nextJob.note = "Skipped (already on PSP)"
+        nextJob.savedDirect = true
+        setJobs((prev) =>
+          prev.map((j) =>
+            j.id === nextJob.id
+              ? {
+                  ...j,
+                  status: "done",
+                  progress: 1,
+                  note: "Skipped (already on PSP)",
+                  savedDirect: true,
+                }
+              : j
+          )
+        )
+        toast.info(`"${nextJob.customTitle || nextJob.file.name}" skipped (already on PSP)`)
+        continue
+      }
+
       const slot = pool.find((s) => !s.busy)
       if (!slot) break
 
@@ -432,7 +608,9 @@ function ConverterPage() {
       slot.jobId = nextJob.id
 
       setJobs((prev) =>
-        prev.map((j) => (j.id === nextJob.id ? { ...j, status: "converting", note: "Starting…" } : j))
+        prev.map((j) =>
+          j.id === nextJob.id ? { ...j, status: "converting", note: "Starting…" } : j
+        )
       )
 
       const baseSettings = getSettingsRef.current()
@@ -440,6 +618,7 @@ function ConverterPage() {
         ...baseSettings,
         title: nextJob.customTitle,
         audioTrackIndex: nextJob.selectedAudioTrack,
+        subtitleCues: nextJob.subtitleCues,
         ...(nextJob.forceSafeMode
           ? {
               encoderMode: nextJob.retryCount && nextJob.retryCount >= 2 ? "software" : "auto",
@@ -467,57 +646,164 @@ function ConverterPage() {
   }, [])
 
   // Probe audio tracks and duration on file drop
-  const probeJob = async (jobId: number, file: File) => {
-    try {
-      const { Input, BlobSource, ALL_FORMATS } = await import("mediabunny")
-      const input = new Input({
-        source: new BlobSource(file, { maxCacheSize: 8 * 1024 * 1024 }),
-        formats: ALL_FORMATS,
-      })
-      const [aTracks, dur] = await Promise.all([
-        input.getAudioTracks().catch(() => []) as Promise<any[]>,
-        input.computeDuration().catch(() => 0),
-      ])
+  const probeJob = React.useCallback(
+    async (jobId: number, file: File) => {
+      try {
+        const { Input, BlobSource, ALL_FORMATS } = await import("mediabunny")
+        const input = new Input({
+          source: new BlobSource(file, { maxCacheSize: 8 * 1024 * 1024 }),
+          formats: ALL_FORMATS,
+        })
+        const [aTracks, dur] = await Promise.all([
+          input.getAudioTracks().catch(() => []) as Promise<any[]>,
+          input.computeDuration().catch(() => 0),
+        ])
 
-      const audioTracks: JobAudioTrack[] = aTracks.map((t, idx) => ({
-        index: idx,
-        label: t.name || (t.language ? `Audio ${idx + 1} (${t.language})` : `Audio Track ${idx + 1}`),
-        language: t.language,
-        codec: t.codec,
-      }))
+        const audioTracks: JobAudioTrack[] = aTracks.map((t, idx) => ({
+          index: idx,
+          label:
+            t.name || (t.language ? `Audio ${idx + 1} (${t.language})` : `Audio Track ${idx + 1}`),
+          language: t.language,
+          codec: t.codec,
+        }))
 
-      setJobs((prev) =>
-        prev.map((j) => (j.id === jobId ? { ...j, duration: dur, audioTracks } : j))
-      )
-    } catch {
-      // Probing is best-effort
-    }
-  }
+        let storageWarning: string | undefined
+        const pspDev = selectedPspDeviceRef.current
+        if (pspDev && dur > 0) {
+          const estBytes = (dur * (Number(videoBitrate) + Number(audioBitrate))) / 8
+          if (estBytes > pspDev.freeBytes) {
+            storageWarning = `Low PSP storage (~ ${formatBytes(estBytes)} needed, ${pspDev.freeFormatted} free)`
+          }
+        }
+
+        setJobs((prev) =>
+          prev.map((j) =>
+            j.id === jobId ? { ...j, duration: dur, audioTracks, storageWarning } : j
+          )
+        )
+      } catch {
+        // Probing is best-effort
+      }
+    },
+    [videoBitrate, audioBitrate]
+  )
 
   const addFiles = React.useCallback(
-    (files: FileList | File[]) => {
+    async (files: FileList | File[]) => {
       const list = Array.from(files).filter((f) => f.size > 0)
       if (list.length === 0) return
 
-      const newJobs: JobItem[] = list.map((file) => {
+      const subFiles = list.filter((f) => f.name.endsWith(".srt") || f.name.endsWith(".vtt"))
+      const videoFiles = list.filter((f) => !f.name.endsWith(".srt") && !f.name.endsWith(".vtt"))
+
+      // If user dropped only subtitle file(s) while videos are already queued, attach to queued jobs
+      if (videoFiles.length === 0 && subFiles.length > 0) {
+        try {
+          const text = await subFiles[0].text()
+          const cues = parseSubtitles(text)
+          setJobs((prev) => {
+            const target = prev.find((j) => j.status === "queued" && !j.subtitleCues)
+            if (!target) return prev
+            return prev.map((j) =>
+              j.id === target.id
+                ? { ...j, subtitleFileName: subFiles[0].name, subtitleCues: cues }
+                : j
+            )
+          })
+          toast.success(`Subtitles attached from ${subFiles[0].name}`)
+        } catch {
+          toast.error("Could not parse subtitle file.")
+        }
+        return
+      }
+
+      // Pre-parse dropped subtitles to map them by base name
+      const subMap = new Map<string, { name: string; cues: SubtitleCue[] }>()
+      for (const sf of subFiles) {
+        const stem = sf.name.replace(/\.[^/.]+$/, "").toLowerCase()
+        try {
+          const text = await sf.text()
+          const cues = parseSubtitles(text)
+          subMap.set(stem, { name: sf.name, cues })
+        } catch {}
+      }
+
+      // 1. IN-QUEUE ANTI-DUPLICATION: Filter out files with same name and size that are already in jobs
+      const existingJobKeys = new Set(jobsRef.current.map((j) => `${j.file.name}_${j.file.size}`))
+      const nonDuplicateFiles: File[] = []
+      let skippedInQueue = 0
+      for (const vf of videoFiles) {
+        const key = `${vf.name}_${vf.size}`
+        if (existingJobKeys.has(key)) {
+          skippedInQueue++
+        } else {
+          existingJobKeys.add(key)
+          nonDuplicateFiles.push(vf)
+        }
+      }
+
+      if (skippedInQueue > 0) {
+        toast.info(
+          skippedInQueue === 1
+            ? "Duplicate video skipped (already in queue)"
+            : `${skippedInQueue} duplicate videos skipped (already in queue)`
+        )
+      }
+
+      if (nonDuplicateFiles.length === 0) return
+
+      // 2. PSP STORAGE ANTI-DUPLICATION: Check against files already on the connected PSP device
+      let currentPspFiles = pspFilesRef.current
+      const pspDev = selectedPspDeviceRef.current
+      if (pspDev?.videoPath) {
+        const fresh = await listPspFiles(pspDev.videoPath)
+        if (fresh.length > 0) {
+          currentPspFiles = fresh
+          setPspFiles(fresh)
+        }
+      }
+      const existingPspNames = new Set(currentPspFiles.map((pf) => pf.name.toLowerCase()))
+
+      let pspDuplicateCount = 0
+      const newJobs: JobItem[] = nonDuplicateFiles.map((file) => {
         const id = nextIdRef.current++
         const cleanTitle = cleanPspTitle(file.name)
         void probeJob(id, file)
+        const stem = file.name.replace(/\.[^/.]+$/, "").toLowerCase()
+        const matchedSub = subMap.get(stem)
+        const { outName } = sanitizePspFilename(cleanTitle)
+        const alreadyOnPsp = existingPspNames.has(outName.toLowerCase())
+        if (alreadyOnPsp) pspDuplicateCount++
+
         return {
           id,
           file,
           customTitle: cleanTitle,
+          outName,
           status: "queued",
           progress: 0,
-          note: "In queue",
+          note: alreadyOnPsp ? "Already on PSP" : "In queue",
+          duplicateOnPsp: alreadyOnPsp,
+          duplicateAction: (alreadyOnPsp ? "skip" : "overwrite") as DuplicateAction,
+          subtitleFileName: matchedSub?.name,
+          subtitleCues: matchedSub?.cues,
         }
       })
 
+      jobsRef.current = [...jobsRef.current, ...newJobs]
       setJobs((prev) => [...prev, ...newJobs])
       setTimeout(pumpQueue, 50)
-      toast.info(`Added ${newJobs.length} video${newJobs.length > 1 ? "s" : ""}`)
+      if (pspDuplicateCount > 0) {
+        toast.warning(
+          pspDuplicateCount === 1
+            ? "1 video already exists on your PSP (will skip unless changed)"
+            : `${pspDuplicateCount} videos already exist on your PSP (will skip unless changed)`
+        )
+      } else {
+        toast.info(`Added ${newJobs.length} video${newJobs.length > 1 ? "s" : ""}`)
+      }
     },
-    [pumpQueue]
+    [probeJob, pumpQueue]
   )
 
   const handleDrop = (e: React.DragEvent) => {
@@ -546,10 +832,24 @@ function ConverterPage() {
     }
     try {
       const handle = await (window as any).showDirectoryPicker({ mode: "readwrite" })
-      setDirHandle(handle)
-      setDirName(handle.name)
-      await saveDirectoryHandle(handle)
-      toast.success(`Saving directly to "${handle.name}"`)
+      let targetHandle = handle
+      let displayName = handle.name
+
+      // If user selected the root of the PSP drive (e.g. "NO NAME", "NO NAME 1"),
+      // automatically target the VIDEO directory so files show up in the PSP XMB video menu
+      if (handle.name.toUpperCase() !== "VIDEO") {
+        try {
+          targetHandle = await handle.getDirectoryHandle("VIDEO", { create: true })
+          displayName = `${handle.name}/VIDEO`
+        } catch {
+          // If VIDEO subfolder cannot be accessed or created, use handle as-is
+        }
+      }
+
+      setDirHandle(targetHandle)
+      setDirName(displayName)
+      await saveDirectoryHandle(targetHandle)
+      toast.success(`Connected to PSP: saving to "${displayName}"`)
     } catch (err: any) {
       if (err.name !== "AbortError") {
         console.error("Directory pick failed:", err)
@@ -598,6 +898,96 @@ function ConverterPage() {
     if (j.url) URL.revokeObjectURL(j.url)
     if (j.thmUrl) URL.revokeObjectURL(j.thmUrl)
   }
+
+  const handleTitleChange = React.useCallback((jobId: number, newTitle: string) => {
+    const { outName } = sanitizePspFilename(newTitle)
+    setJobs((prev) =>
+      prev.map((j) =>
+        j.id === jobId
+          ? {
+              ...j,
+              customTitle: newTitle,
+              outName,
+            }
+          : j
+      )
+    )
+    const j = jobsRef.current.find((item) => item.id === jobId)
+    if (j) {
+      j.customTitle = newTitle
+      j.outName = outName
+    }
+  }, [])
+
+  const handleTitleBlurOrEnter = React.useCallback(
+    async (jobId: number) => {
+      const job = jobsRef.current.find((item) => item.id === jobId)
+      if (!job || job.status !== "done" || !job.buffer) return
+
+      const { outName, thmName } = sanitizePspFilename(job.customTitle)
+
+      // Handle rename on auto-detected PSP device
+      if (job.savedToPspPath && job.savedOutName && job.savedOutName !== outName) {
+        const saveRes = await saveBuffersToPspApi(
+          job.savedToPspPath,
+          outName,
+          job.buffer,
+          thmName,
+          job.thmBuffer,
+          job.savedOutName,
+          "overwrite"
+        )
+        if (saveRes.success) {
+          const finalName = saveRes.filename || outName
+          job.savedOutName = finalName
+          job.outName = finalName
+          setJobs((prev) =>
+            prev.map((j) =>
+              j.id === jobId ? { ...j, savedOutName: finalName, outName: finalName } : j
+            )
+          )
+          toast.success(`Renamed file to "${finalName}" on PSP`)
+          void refreshPspFiles(job.savedToPspPath)
+          return
+        }
+      }
+
+      if (!dirHandleRef.current) return
+      const currentDir = dirHandleRef.current
+
+      if (job.savedOutName && job.savedOutName !== outName) {
+        try {
+          const newFileHandle = await currentDir.getFileHandle(outName, { create: true })
+          const writable = await (newFileHandle as any).createWritable()
+          await writable.write(job.buffer)
+          await writable.close()
+
+          if (job.thmBuffer) {
+            const newThmHandle = await currentDir.getFileHandle(thmName, { create: true })
+            const thmWritable = await (newThmHandle as any).createWritable()
+            await thmWritable.write(job.thmBuffer)
+            await thmWritable.close()
+          }
+
+          try {
+            await (currentDir as any).removeEntry(job.savedOutName)
+            const oldThmName = job.savedOutName.replace(/\.mp4$/i, ".thm")
+            await (currentDir as any).removeEntry(oldThmName)
+          } catch {}
+
+          job.savedOutName = outName
+          setJobs((prev) =>
+            prev.map((j) => (j.id === jobId ? { ...j, savedOutName: outName, outName } : j))
+          )
+          toast.success(`Renamed file to "${outName}" in PSP folder`)
+        } catch (err) {
+          console.warn("Failed to rename file in PSP folder:", err)
+          toast.error("Could not update file name in PSP folder")
+        }
+      }
+    },
+    [refreshPspFiles]
+  )
 
   const cancelJob = (id: number) => {
     const slot = poolRef.current.find((s) => s.jobId === id)
@@ -652,7 +1042,10 @@ function ConverterPage() {
     if (typeof window !== "undefined") {
       ;(window as any).__psp = {
         addFiles,
-        jobs: jobsRef.current,
+        get jobs() {
+          return jobsRef.current
+        },
+        renameJob: handleTitleChange,
         mergeQueuedJobs,
         clearAllJobs,
         retryJob,
@@ -669,20 +1062,13 @@ function ConverterPage() {
       <div className="flex min-h-screen flex-col bg-background text-foreground selection:bg-primary selection:text-primary-foreground">
         {/* Main Content Area */}
         <main className="mx-auto flex w-full max-w-6xl flex-1 flex-col gap-6 p-4 py-6 sm:p-8 lg:flex-row">
-          {/* Settings Column */}
+          {/* Options Column */}
           <section className="w-full lg:w-80 shrink-0 flex flex-col gap-4">
-            <Card className="rounded-2xl border-border bg-card shadow-sm">
-              <CardHeader className="pb-3">
-                <div className="flex items-center gap-2">
-                  <HugeiconsIcon icon={Settings01Icon} className="size-4 text-primary" />
-                  <CardTitle className="text-sm font-semibold">Settings</CardTitle>
-                </div>
-                <CardDescription className="text-xs">Adjust video and audio quality</CardDescription>
-              </CardHeader>
-              <CardContent className="flex flex-col gap-3.5 text-xs">
-                {/* Resolution */}
+            <Card className="rounded-2xl border-border bg-card p-4 shadow-sm">
+              <div className="flex flex-col gap-3 text-xs">
+                {/* Screen Size */}
                 <div className="flex flex-col gap-1.5">
-                  <Label className="text-xs text-muted-foreground">Screen Size</Label>
+                  <Label className="text-xs text-muted-foreground font-medium">Screen Size</Label>
                   <Select
                     value={preset}
                     onValueChange={(v) => {
@@ -693,20 +1079,20 @@ function ConverterPage() {
                     }}
                   >
                     <SelectTrigger className="w-full h-8 text-xs">
-                      <SelectValue />
+                      <SelectValue placeholder="Screen size" />
                     </SelectTrigger>
                     <SelectContent>
                       <SelectGroup>
-                        <SelectItem value="go">Standard (480×272) — All PSP models</SelectItem>
-                        <SelectItem value="tv">High Resolution (720×480) — TV Cable & ARK-4</SelectItem>
+                        <SelectItem value="go">PSP Screen (480 × 272)</SelectItem>
+                        <SelectItem value="tv">Full Resolution (720 × 480)</SelectItem>
                       </SelectGroup>
                     </SelectContent>
                   </Select>
                 </div>
 
-                {/* Video Bitrate */}
+                {/* Video Quality */}
                 <div className="flex flex-col gap-1.5">
-                  <Label className="text-xs text-muted-foreground">Video Quality</Label>
+                  <Label className="text-xs text-muted-foreground font-medium">Video Quality</Label>
                   <Select
                     value={videoBitrate}
                     onValueChange={(v) => {
@@ -717,22 +1103,22 @@ function ConverterPage() {
                     }}
                   >
                     <SelectTrigger className="w-full h-8 text-xs">
-                      <SelectValue />
+                      <SelectValue placeholder="Video quality" />
                     </SelectTrigger>
                     <SelectContent>
                       <SelectGroup>
-                        <SelectItem value="800000">Balanced (Recommended)</SelectItem>
+                        <SelectItem value="800000">Balanced</SelectItem>
                         <SelectItem value="1200000">High Quality</SelectItem>
-                        <SelectItem value="1600000">Best Quality (Larger file)</SelectItem>
-                        <SelectItem value="550000">Small File Size</SelectItem>
+                        <SelectItem value="1600000">Maximum Quality</SelectItem>
+                        <SelectItem value="550000">Smallest File</SelectItem>
                       </SelectGroup>
                     </SelectContent>
                   </Select>
                 </div>
 
-                {/* Audio Bitrate */}
+                {/* Audio Quality */}
                 <div className="flex flex-col gap-1.5">
-                  <Label className="text-xs text-muted-foreground">Audio Quality</Label>
+                  <Label className="text-xs text-muted-foreground font-medium">Audio Quality</Label>
                   <Select
                     value={audioBitrate}
                     onValueChange={(v) => {
@@ -743,21 +1129,23 @@ function ConverterPage() {
                     }}
                   >
                     <SelectTrigger className="w-full h-8 text-xs">
-                      <SelectValue />
+                      <SelectValue placeholder="Audio quality" />
                     </SelectTrigger>
                     <SelectContent>
                       <SelectGroup>
-                        <SelectItem value="128000">Standard (Recommended)</SelectItem>
-                        <SelectItem value="96000">Compact (Podcasts & Speech)</SelectItem>
-                        <SelectItem value="160000">High Quality (Music)</SelectItem>
+                        <SelectItem value="128000">Standard Audio (128 kbps)</SelectItem>
+                        <SelectItem value="96000">Voice & Speech (96 kbps)</SelectItem>
+                        <SelectItem value="160000">High Fidelity (160 kbps)</SelectItem>
                       </SelectGroup>
                     </SelectContent>
                   </Select>
                 </div>
 
-                {/* LCD Shadow Boost */}
+                {/* Display Colors */}
                 <div className="flex flex-col gap-1.5">
-                  <Label className="text-xs text-muted-foreground">Colors</Label>
+                  <Label className="text-xs text-muted-foreground font-medium">
+                    Display Colors
+                  </Label>
                   <Select
                     value={lcdBoost}
                     onValueChange={(v) => {
@@ -768,20 +1156,22 @@ function ConverterPage() {
                     }}
                   >
                     <SelectTrigger className="w-full h-8 text-xs">
-                      <SelectValue />
+                      <SelectValue placeholder="Display colors" />
                     </SelectTrigger>
                     <SelectContent>
                       <SelectGroup>
-                        <SelectItem value="off">Natural colors</SelectItem>
-                        <SelectItem value="on">Vibrant (Fixes dark scenes on older PSP-1000/2000)</SelectItem>
+                        <SelectItem value="off">Natural</SelectItem>
+                        <SelectItem value="on">Vibrant Colors</SelectItem>
                       </SelectGroup>
                     </SelectContent>
                   </Select>
                 </div>
 
-                {/* Parallel Pipeline */}
+                {/* Conversion Speed */}
                 <div className="flex flex-col gap-1.5">
-                  <Label className="text-xs text-muted-foreground">Speed</Label>
+                  <Label className="text-xs text-muted-foreground font-medium">
+                    Conversion Speed
+                  </Label>
                   <Select
                     value={pipelineMode}
                     onValueChange={(v) => {
@@ -792,12 +1182,12 @@ function ConverterPage() {
                     }}
                   >
                     <SelectTrigger className="w-full h-8 text-xs">
-                      <SelectValue />
+                      <SelectValue placeholder="Conversion speed" />
                     </SelectTrigger>
                     <SelectContent>
                       <SelectGroup>
-                        <SelectItem value="segmented">Fast (Multi-core acceleration)</SelectItem>
-                        <SelectItem value="single">Standard</SelectItem>
+                        <SelectItem value="segmented">Fast (Multi-core)</SelectItem>
+                        <SelectItem value="single">Standard (Low memory)</SelectItem>
                       </SelectGroup>
                     </SelectContent>
                   </Select>
@@ -805,30 +1195,136 @@ function ConverterPage() {
 
                 <Separator className="my-1 bg-border/60" />
 
-                {/* Destination / Disk Stream */}
+                {/* Save Location / Auto-detected PSP */}
                 <div className="flex flex-col gap-2">
-                  <Label className="text-xs text-muted-foreground">Where to Save</Label>
-                  {dirName ? (
+                  <div className="flex items-center justify-between">
+                    <Label className="text-xs text-muted-foreground font-medium">
+                      Save Location
+                    </Label>
+                    {selectedPspDevice ? (
+                      <span className="flex items-center gap-1.5 text-[11px] font-medium text-emerald-500">
+                        <span className="size-2 rounded-full bg-emerald-500 animate-pulse" />
+                        PSP Connected
+                      </span>
+                    ) : null}
+                  </div>
+
+                  {selectedPspDevice ? (
+                    <div className="flex flex-col gap-2 rounded-xl bg-muted/30 border border-border/80 p-2.5">
+                      <div className="flex items-center gap-2">
+                        <HugeiconsIcon
+                          icon={UsbConnected01Icon}
+                          className="size-4 text-emerald-500 shrink-0"
+                        />
+                        <div className="flex-1 min-w-0">
+                          {detectedDevices.length > 1 ? (
+                            <Select
+                              value={selectedPspDevice.id}
+                              onValueChange={(v) => {
+                                if (v) setSelectedDeviceId(v)
+                              }}
+                            >
+                              <SelectTrigger className="w-full h-8 text-xs">
+                                <SelectValue>
+                                  {selectedPspDevice.name} ({selectedPspDevice.freeFormatted} free)
+                                </SelectValue>
+                              </SelectTrigger>
+                              <SelectContent>
+                                <SelectGroup>
+                                  {detectedDevices.map((d) => (
+                                    <SelectItem key={d.id} value={d.id}>
+                                      {d.name} ({d.freeFormatted} free)
+                                    </SelectItem>
+                                  ))}
+                                </SelectGroup>
+                              </SelectContent>
+                            </Select>
+                          ) : (
+                            <span className="text-xs font-medium text-foreground truncate block">
+                              {selectedPspDevice.name} ({selectedPspDevice.freeFormatted} free)
+                            </span>
+                          )}
+                        </div>
+                      </div>
+
+                      <div className="flex items-center justify-between pt-1 border-t border-border/40 text-[11px] text-muted-foreground">
+                        <span>Target: /VIDEO</span>
+                        <button
+                          type="button"
+                          onClick={() => setAutoSaveToPsp(!autoSaveToPsp)}
+                          className={`text-[10px] font-medium px-2 py-0.5 rounded cursor-pointer transition-colors ${
+                            autoSaveToPsp
+                              ? "bg-emerald-500/15 text-emerald-400 border border-emerald-500/30"
+                              : "bg-muted text-muted-foreground border border-border"
+                          }`}
+                        >
+                          {autoSaveToPsp ? "Direct Save Active" : "Direct Save Paused"}
+                        </button>
+                      </div>
+
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        onClick={() => setStorageManagerOpen(true)}
+                        className="w-full h-8 text-xs gap-2 justify-between rounded-lg"
+                      >
+                        <div className="flex items-center gap-1.5 truncate">
+                          <HugeiconsIcon
+                            icon={Film01Icon}
+                            className="size-3.5 text-muted-foreground"
+                          />
+                          <span>Manage PSP Videos</span>
+                        </div>
+                        <Badge
+                          variant="secondary"
+                          className="text-[10px] px-1.5 py-0 h-4 font-normal"
+                        >
+                          {pspFiles.length}
+                        </Badge>
+                      </Button>
+                    </div>
+                  ) : dirName ? (
                     <div className="flex items-center justify-between rounded-xl bg-muted/40 p-2 border border-border">
                       <div className="flex items-center gap-2 truncate">
-                        <HugeiconsIcon icon={Folder01Icon} className="size-4 text-emerald-500 shrink-0" />
-                        <span className="truncate font-mono text-[11px] text-foreground">{dirName}</span>
+                        <HugeiconsIcon
+                          icon={Folder01Icon}
+                          className="size-4 text-emerald-500 shrink-0"
+                        />
+                        <span className="truncate font-mono text-[11px] text-foreground">
+                          {dirName}
+                        </span>
                       </div>
-                      <Button variant="ghost" size="xs" onClick={clearDirectory} className="text-muted-foreground hover:text-destructive">
+                      <Button
+                        variant="ghost"
+                        size="xs"
+                        onClick={clearDirectory}
+                        className="text-muted-foreground hover:text-destructive"
+                      >
                         Reset
                       </Button>
                     </div>
                   ) : (
-                    <Button variant="outline" size="sm" onClick={chooseDirectory} className="w-full text-xs gap-1.5 border-dashed">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={chooseDirectory}
+                      className="w-full text-xs gap-1.5 border-dashed"
+                    >
                       <HugeiconsIcon icon={Folder01Icon} className="size-3.5 text-primary" />
-                      Save directly to PSP Memory Stick
+                      Choose PSP folder
                     </Button>
                   )}
+
                   <span className="text-[11px] text-muted-foreground leading-snug">
-                    {dirName ? "Videos will save directly into this folder." : "Videos will download to your browser."}
+                    {selectedPspDevice && autoSaveToPsp
+                      ? "Videos will save straight to your PSP Go over USB."
+                      : dirName
+                        ? "Videos will save directly into this folder."
+                        : "Connect PSP via USB or choose a folder to save directly."}
                   </span>
                 </div>
-              </CardContent>
+              </div>
             </Card>
           </section>
 
@@ -860,7 +1356,9 @@ function ConverterPage() {
               <div className="flex size-12 items-center justify-center rounded-2xl bg-muted text-muted-foreground mb-3">
                 <HugeiconsIcon icon={Film01Icon} className="size-6 text-primary" />
               </div>
-              <h3 className="font-heading text-sm font-medium">Drop video files here or click to browse</h3>
+              <h3 className="font-heading text-sm font-medium">
+                Drop video files here or click to browse
+              </h3>
               <p className="mt-1 text-xs text-muted-foreground">
                 Supports MP4, MKV, AVI, MOV, WEBM. Includes cover art for your PSP.
               </p>
@@ -871,7 +1369,8 @@ function ConverterPage() {
               <div className="flex flex-wrap items-center justify-between gap-2 px-1">
                 <div className="flex items-center gap-2 text-xs text-muted-foreground">
                   <span>
-                    <strong className="text-foreground">{jobs.length}</strong> {jobs.length === 1 ? "video" : "videos"}
+                    <strong className="text-foreground">{jobs.length}</strong>{" "}
+                    {jobs.length === 1 ? "video" : "videos"}
                   </span>
                   {convertingCount > 0 && (
                     <Badge variant="secondary" className="text-[10px] animate-pulse">
@@ -882,12 +1381,22 @@ function ConverterPage() {
 
                 <div className="flex items-center gap-2">
                   {queuedCount >= 2 && (
-                    <Button variant="outline" size="sm" onClick={mergeQueuedJobs} className="text-xs gap-1.5">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={mergeQueuedJobs}
+                      className="text-xs gap-1.5"
+                    >
                       <HugeiconsIcon icon={Layers01Icon} className="size-3.5 text-primary" />
                       Combine into one video ({queuedCount} parts)
                     </Button>
                   )}
-                  <Button variant="ghost" size="sm" onClick={clearAllJobs} className="text-xs text-muted-foreground hover:text-destructive gap-1.5">
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={clearAllJobs}
+                    className="text-xs text-muted-foreground hover:text-destructive gap-1.5"
+                  >
                     <HugeiconsIcon icon={Delete02Icon} className="size-3.5" />
                     Clear list
                   </Button>
@@ -903,36 +1412,49 @@ function ConverterPage() {
                     {/* Header Row */}
                     <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
                       <div className="flex flex-1 items-center gap-2 min-w-0">
-                        <Input
-                          value={job.customTitle}
-                          onChange={(e) => {
-                            const newTitle = e.target.value
-                            setJobs((prev) =>
-                              prev.map((j) => (j.id === job.id ? { ...j, customTitle: newTitle } : j))
-                            )
-                          }}
-                          disabled={job.status === "converting" || job.status === "done"}
-                          className="h-7 text-xs font-medium font-sans max-w-sm"
-                          placeholder="Title"
-                        />
+                        <div className="relative flex flex-1 items-center max-w-sm min-w-0">
+                          <Input
+                            value={job.customTitle}
+                            onChange={(e) => handleTitleChange(job.id, e.target.value)}
+                            onBlur={() => void handleTitleBlurOrEnter(job.id)}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter") {
+                                e.currentTarget.blur()
+                              }
+                            }}
+                            className="h-7 pr-7 text-xs font-medium font-sans focus-visible:ring-1"
+                            placeholder="Video title"
+                            title="Click to rename video and output file"
+                          />
+                          <HugeiconsIcon
+                            icon={Edit02Icon}
+                            className="absolute right-2 size-3 text-muted-foreground/50 pointer-events-none"
+                          />
+                        </div>
                         {job.isMerge && (
                           <Badge variant="secondary" className="text-[10px] shrink-0">
                             Combined
                           </Badge>
                         )}
                         {job.forceSafeMode && (
-                          <Badge variant="outline" className="text-[10px] shrink-0 border-amber-500/40 text-amber-400">
+                          <Badge
+                            variant="outline"
+                            className="text-[10px] shrink-0 border-amber-500/40 text-amber-400"
+                          >
                             Safe Mode
+                          </Badge>
+                        )}
+                        {job.duplicateOnPsp && (
+                          <Badge
+                            variant="outline"
+                            className="text-[10px] shrink-0 border-amber-500/40 text-amber-500 bg-amber-500/10"
+                          >
+                            Already on PSP
                           </Badge>
                         )}
                       </div>
 
                       <div className="flex items-center gap-1.5 shrink-0">
-                        {job.profileBadge && (
-                          <Badge variant="default" className="text-[10px] bg-emerald-600/90 text-white font-medium">
-                            PSP Ready
-                          </Badge>
-                        )}
                         <Badge
                           variant={
                             job.status === "done"
@@ -945,43 +1467,184 @@ function ConverterPage() {
                           }
                           className="text-[10px] capitalize font-medium"
                         >
-                          {job.status === "converting" ? "Converting…" : job.status === "done" ? "Ready" : job.status}
+                          {job.status === "converting"
+                            ? "Converting…"
+                            : job.status === "done"
+                              ? "Ready"
+                              : job.status}
                         </Badge>
                       </div>
                     </div>
 
                     {/* Controls & Badges Row */}
                     <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                      {job.outName ? (
+                        <span
+                          className="font-mono text-[11px] text-muted-foreground/70"
+                          title="Output filename"
+                        >
+                          {job.outName}
+                        </span>
+                      ) : null}
                       {job.duration ? (
                         <span className="font-mono text-[11px]">{fmtTime(job.duration)}</span>
                       ) : null}
 
-                      {/* Audio track selector if multiple tracks */}
-                      {job.audioTracks && job.audioTracks.length > 1 && job.status === "queued" && (
-                        <div className="flex items-center gap-1">
-                          <span className="text-[11px]">Audio:</span>
-                          <select
-                            value={job.selectedAudioTrack ?? 0}
-                            onChange={(e) => {
-                              const trackIdx = Number(e.target.value)
+                      {/* Duplicate on PSP control */}
+                      {job.duplicateOnPsp && job.status === "queued" && (
+                        <div className="flex items-center gap-1.5 rounded-md bg-amber-500/10 border border-amber-500/20 px-2 py-0.5 text-xs text-amber-500">
+                          <span className="font-medium text-[11px]">Already on PSP:</span>
+                          <Select
+                            value={job.duplicateAction || "skip"}
+                            onValueChange={(val) => {
+                              if (!val) return
                               setJobs((prev) =>
-                                prev.map((j) => (j.id === job.id ? { ...j, selectedAudioTrack: trackIdx } : j))
+                                prev.map((j) =>
+                                  j.id === job.id
+                                    ? {
+                                        ...j,
+                                        duplicateAction: val as DuplicateAction,
+                                        note:
+                                          val === "skip"
+                                            ? "Already on PSP (Will skip)"
+                                            : val === "keep_both"
+                                              ? "Save as new copy"
+                                              : "Will replace file on PSP",
+                                      }
+                                    : j
+                                )
                               )
                             }}
-                            className="h-6 rounded-md bg-muted px-1.5 text-[11px] border border-border"
                           >
-                            {job.audioTracks.map((tr) => (
-                              <option key={tr.index} value={tr.index}>
-                                {tr.label}
-                              </option>
-                            ))}
-                          </select>
+                            <SelectTrigger className="h-5 text-[10px] px-1.5 py-0 bg-background/60 border-amber-500/30">
+                              <SelectValue />
+                            </SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value="skip">Skip</SelectItem>
+                              <SelectItem value="overwrite">Replace existing</SelectItem>
+                              <SelectItem value="keep_both">Keep both</SelectItem>
+                            </SelectContent>
+                          </Select>
                         </div>
+                      )}
+
+                      {/* Storage warning badge */}
+                      {job.storageWarning && (
+                        <Badge
+                          variant="outline"
+                          className="text-[10px] text-destructive border-destructive/30 shrink-0"
+                        >
+                          {job.storageWarning}
+                        </Badge>
+                      )}
+
+                      {/* Audio track selector if multiple tracks */}
+                      {job.audioTracks && job.audioTracks.length > 1 && job.status === "queued" && (
+                        <div className="flex items-center gap-1.5">
+                          <span className="text-[11px]">Audio:</span>
+                          <Select
+                            value={String(job.selectedAudioTrack ?? 0)}
+                            onValueChange={(v) => {
+                              if (v !== undefined) {
+                                const trackIdx = Number(v)
+                                setJobs((prev) =>
+                                  prev.map((j) =>
+                                    j.id === job.id ? { ...j, selectedAudioTrack: trackIdx } : j
+                                  )
+                                )
+                              }
+                            }}
+                          >
+                            <SelectTrigger className="h-6 text-[11px] px-2 py-0 min-w-[100px]">
+                              <SelectValue placeholder="Audio track" />
+                            </SelectTrigger>
+                            <SelectContent>
+                              <SelectGroup>
+                                {job.audioTracks.map((tr) => (
+                                  <SelectItem key={tr.index} value={String(tr.index)}>
+                                    {tr.label}
+                                  </SelectItem>
+                                ))}
+                              </SelectGroup>
+                            </SelectContent>
+                          </Select>
+                        </div>
+                      )}
+
+                      {/* Subtitles control */}
+                      {job.status === "queued" &&
+                        (job.subtitleFileName ? (
+                          <div className="flex items-center gap-1 rounded-md bg-muted/80 px-2 py-0.5 border border-border/60 text-[11px]">
+                            <HugeiconsIcon
+                              icon={ClosedCaptionIcon}
+                              className="size-3 text-primary"
+                            />
+                            <span className="max-w-[130px] truncate">{job.subtitleFileName}</span>
+                            <button
+                              type="button"
+                              title="Remove subtitles"
+                              onClick={() => {
+                                setJobs((prev) =>
+                                  prev.map((j) =>
+                                    j.id === job.id
+                                      ? {
+                                          ...j,
+                                          subtitleFileName: undefined,
+                                          subtitleCues: undefined,
+                                        }
+                                      : j
+                                  )
+                                )
+                              }}
+                              className="ml-0.5 text-muted-foreground hover:text-destructive text-xs font-bold leading-none"
+                            >
+                              ×
+                            </button>
+                          </div>
+                        ) : (
+                          <label className="cursor-pointer inline-flex items-center gap-1 rounded-md bg-muted/40 hover:bg-muted px-2 py-0.5 border border-dashed border-border text-[11px] text-muted-foreground hover:text-foreground transition-colors">
+                            <HugeiconsIcon
+                              icon={ClosedCaptionIcon}
+                              className="size-3 text-muted-foreground"
+                            />
+                            <span>+ Subtitles (.srt)</span>
+                            <input
+                              type="file"
+                              accept=".srt,.vtt"
+                              className="hidden"
+                              onChange={async (e) => {
+                                const file = e.target.files?.[0]
+                                if (!file) return
+                                try {
+                                  const text = await file.text()
+                                  const cues = parseSubtitles(text)
+                                  setJobs((prev) =>
+                                    prev.map((j) =>
+                                      j.id === job.id
+                                        ? { ...j, subtitleFileName: file.name, subtitleCues: cues }
+                                        : j
+                                    )
+                                  )
+                                  toast.success(`Subtitles attached: ${file.name}`)
+                                } catch {
+                                  toast.error("Failed to parse subtitle file.")
+                                }
+                              }}
+                            />
+                          </label>
+                        ))}
+                      {job.subtitleFileName && job.status !== "queued" && (
+                        <span className="inline-flex items-center gap-1 text-[11px] text-primary">
+                          <HugeiconsIcon icon={ClosedCaptionIcon} className="size-3" />
+                          <span>Subtitles baked</span>
+                        </span>
                       )}
 
                       {job.dims && <span className="font-mono text-[11px]">{job.dims}</span>}
                       {job.outSize ? (
-                        <span className="font-mono text-[11px]">{(job.outSize / (1024 * 1024)).toFixed(1)} MB</span>
+                        <span className="font-mono text-[11px]">
+                          {(job.outSize / (1024 * 1024)).toFixed(1)} MB
+                        </span>
                       ) : null}
                     </div>
 
@@ -1012,28 +1675,81 @@ function ConverterPage() {
 
                         {job.thmUrl && (
                           <Tooltip>
-                            <TooltipTrigger render={
-                              <a
-                                href={job.thmUrl}
-                                download={(job.outName || "video.mp4").replace(/\.mp4$/i, ".thm")}
-                                className="inline-flex items-center gap-1.5 rounded-full border border-border bg-card px-3 py-1 text-xs font-medium hover:bg-muted transition-colors"
-                              >
-                                <HugeiconsIcon icon={Image01Icon} className="size-3.5 text-muted-foreground" />
-                                Cover Art (.THM)
-                              </a>
-                            } />
+                            <TooltipTrigger
+                              render={
+                                <a
+                                  href={job.thmUrl}
+                                  download={(job.outName || "video.mp4").replace(/\.mp4$/i, ".thm")}
+                                  className="inline-flex items-center gap-1.5 rounded-full border border-border bg-card px-3 py-1 text-xs font-medium hover:bg-muted transition-colors"
+                                >
+                                  <HugeiconsIcon
+                                    icon={Image01Icon}
+                                    className="size-3.5 text-muted-foreground"
+                                  />
+                                  Cover Art (.THM)
+                                </a>
+                              }
+                            />
                             <TooltipContent>
-                              Put this file in the same folder as the video on your PSP to see the thumbnail
+                              Put this file in the same folder as the video on your PSP to see the
+                              thumbnail
                             </TooltipContent>
                           </Tooltip>
                         )}
 
-                        {job.savedDirect && (
-                          <span className="inline-flex items-center gap-1 text-[11px] text-emerald-500 font-medium">
-                            <HugeiconsIcon icon={CheckmarkCircle02Icon} className="size-3.5" />
-                            Saved directly to PSP
-                          </span>
-                        )}
+                        {job.duplicateOnPsp &&
+                          job.status === "done" &&
+                          job.note?.includes("Skipped") && (
+                            <div className="flex items-center gap-2">
+                              <Button
+                                variant="outline"
+                                size="xs"
+                                onClick={() => {
+                                  setJobs((prev) =>
+                                    prev.map((j) =>
+                                      j.id === job.id
+                                        ? {
+                                            ...j,
+                                            status: "queued",
+                                            progress: 0,
+                                            duplicateAction: "overwrite" as DuplicateAction,
+                                            note: "Will replace file on PSP",
+                                          }
+                                        : j
+                                    )
+                                  )
+                                  setTimeout(pumpQueue, 50)
+                                }}
+                                className="text-xs gap-1"
+                              >
+                                <HugeiconsIcon icon={RefreshIcon} className="size-3" />
+                                Replace on PSP
+                              </Button>
+                              <Button
+                                variant="outline"
+                                size="xs"
+                                onClick={() => {
+                                  setJobs((prev) =>
+                                    prev.map((j) =>
+                                      j.id === job.id
+                                        ? {
+                                            ...j,
+                                            status: "queued",
+                                            progress: 0,
+                                            duplicateAction: "keep_both" as DuplicateAction,
+                                            note: "Save as new copy",
+                                          }
+                                        : j
+                                    )
+                                  )
+                                  setTimeout(pumpQueue, 50)
+                                }}
+                                className="text-xs gap-1"
+                              >
+                                Save as copy
+                              </Button>
+                            </div>
+                          )}
 
                         {job.status === "failed" && (
                           <div className="flex items-center gap-2">
@@ -1061,7 +1777,12 @@ function ConverterPage() {
 
                       <div className="flex items-center gap-1">
                         {job.status === "converting" && (
-                          <Button variant="outline" size="xs" onClick={() => cancelJob(job.id)} className="text-xs text-destructive">
+                          <Button
+                            variant="outline"
+                            size="xs"
+                            onClick={() => cancelJob(job.id)}
+                            className="text-xs text-destructive"
+                          >
                             Cancel
                           </Button>
                         )}
@@ -1081,6 +1802,20 @@ function ConverterPage() {
             </div>
           </section>
         </main>
+
+        <PspStorageManager
+          open={storageManagerOpen}
+          onOpenChange={setStorageManagerOpen}
+          pspDevices={detectedDevices}
+          selectedDevice={selectedPspDevice}
+          onSelectDevice={(dev) => setSelectedDeviceId(dev.id)}
+          onRefreshStorage={async () => {
+            await refreshPspStatus()
+            if (selectedPspDevice) {
+              await refreshPspFiles(selectedPspDevice.videoPath)
+            }
+          }}
+        />
       </div>
     </TooltipProvider>
   )

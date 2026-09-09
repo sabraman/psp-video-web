@@ -1,15 +1,37 @@
 {
   "name": "psp-video-web",
-  "version": "0.1.0",
-  "private": true,
+  "version": "1.0.0",
+  "private": false,
+  "description": "In-browser PSP video converter with WebCodecs, MediaBunny, direct USB storage streaming, and file management.",
+  "keywords": [
+    "aac",
+    "client-side",
+    "h264",
+    "mediabunny",
+    "playstation-portable",
+    "psp",
+    "tailwind",
+    "tanstack-start",
+    "video-converter",
+    "webcodecs"
+  ],
+  "homepage": "https://github.com/sabraman/psp-video-web#readme",
+  "license": "MIT",
+  "author": "sabraman",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sabraman/psp-video-web.git"
+  },
   "type": "module",
-  "description": "In-browser PSP Go video converter. Drag in videos, get 480x272 H.264 Baseline + AAC MP4s. 100% client-side via MediaBunny.",
   "scripts": {
     "dev": "vite dev --port 3005",
     "build": "bun build src/worker.ts --outfile public/worker.js --target browser && vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
-    "start": "vite preview --port 3005"
+    "start": "vite preview --port 3005",
+    "lint": "oxlint",
+    "format": "oxfmt",
+    "format:check": "oxfmt --check"
   },
   "dependencies": {
     "@base-ui/react": "^1.8.0",
@@ -42,6 +64,8 @@
     "@types/react-dom": "^19",
     "@vitejs/plugin-react": "^6",
     "bun-types": "^1.4.2",
+    "oxfmt": "^0.67.0",
+    "oxlint": "^1.82.0",
     "typescript": "^5.9.2",
     "vite": "^8"
   }

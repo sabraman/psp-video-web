@@ -7,3 +7,8 @@ public/worker.js.map
 .DS_Store
 *.png
 test_tanstack_cdp.ts
+
+.vercel
+*.log
+public/prizrak*.mp4
+public/film60.mp4
