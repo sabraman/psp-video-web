@@ -16,7 +16,7 @@ Video files never leave the user's computer. All demuxing, video frame decoding,
 
 The PSP hardware media engine (Media Engine chip + AVC decoder) is rigid. Files that play on modern desktop players will crash the PSP or display `80020001 / Unsupported Data` if any specification is exceeded:
 
-- **Codec**: H.264 / AVC Constrained Baseline Profile (`avc1.42E01E`). Profile must be Baseline; Level must be `<= 3.0` (`0x1E`).
+- **Codec**: H.264 / AVC Constrained Baseline Profile (`avc1.42E01E`). Profile must be Baseline; Level must be `<= 3.0` (`0x1E`). Zero B-frames (`has_b_frames` must be `0`) and a single reference frame — proven on real hardware: Main Profile L2.1 _with_ B-frames fails with `Unsupported Data`, while Main L2.1 _without_ B-frames plays. B-frame presence is invisible to desktop players (preview looks fine) and can't be detected from the `avcC` box alone, so never remux Main Profile sources — always re-encode to Baseline.
 - **Resolution**: Native display is strictly `480x272`. TV-out profile allows up to `720x480` (FW >= 3.30).
 - **Framerate**: Maximum `29.97 fps` (`30000/1001`). Frame rates above 30 fps crash playback.
 - **Audio**: AAC-LC (`mp4a.40.2`), mono or stereo (`<= 2` channels), `44.1 kHz` or `48.0 kHz`.
@@ -48,8 +48,8 @@ Video transcoding processes gigabytes of raw frame data in memory. A single leak
 
 ## The Three Ways to Hurt Yourself
 
-1. **Emitting Main or High Profile H.264**:
-   WebCodecs encoders default to Main or High profiles unless explicitly configured with `avc1.42E01E`. The output MP4 must always be verified by parsing the `avcC` box in the MP4 header. Never remove the profile check or assume browser defaults are safe.
+1. **Emitting Main or High Profile H.264, or any B-frames**:
+   WebCodecs encoders default to Main or High profiles unless explicitly configured with `avc1.42E01E`. The output MP4 must always be verified by parsing the `avcC` box in the MP4 header. Never remove the profile check or assume browser defaults are safe. B-frames (`has_b_frames > 0`) are unplayable on real hardware even inside an otherwise-compliant Main L2.1 stream, so the remux/passthrough path must accept Baseline sources only, and every output path (single-pass, segmented, merge) must enforce Baseline before delivery.
 2. **Leaking Hardware VideoFrames and Canvas Contexts**:
    Allocating an `OffscreenCanvas` per frame or forgetting to call `frame.close()` will exhaust GPU textures on Apple Silicon / Windows within seconds. Use persistent pooled canvases and enforce synchronous frame closure in decode pump loops.
 3. **Leaving Orphan macOS Metadata on FAT32**:

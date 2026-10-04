@@ -44,6 +44,15 @@ export interface Tunables {
   diagnostic?: "full" | "decode"
   /** Split one file into N keyframe-aligned segments transcoded in parallel workers (N ≥ 2 enables). */
   segs?: number
+  /**
+   * Duplicate-frame detection is always on: consecutive bit-identical frames
+   * (held anime cels, static shots) skip the H.264 encode and are held via
+   * the MP4 timestamp gap. Real motion never matches, so no content-type
+   * switch is needed.
+   * Sum-of-absolute-differences budget for that detection (default 7000).
+   * Lower = stricter. Only useful for experiments.
+   */
+  dupBudget?: number
 }
 
 export interface SubtitleCue {
@@ -127,7 +136,9 @@ export function profileBadge(info: AvcInfo | null): { text: string; cls: string 
     return { text: `${name} ${level} ✓ PSP-ready`, cls: "green" }
   }
   if (info.profileIdc === 77 && info.levelIdc <= 30) {
-    return { text: `${name} ${level} — plays on Go`, cls: "amber" }
+    // Main without B-frames plays, Main with B-frames doesn't — and avcC
+    // alone can't tell them apart, so never promise PSP playback for Main.
+    return { text: `${name} ${level} — risky on PSP (B-frames?)`, cls: "red" }
   }
   return { text: `${name} ${level} — may not play`, cls: "red" }
 }
@@ -247,7 +258,7 @@ export function renderSubtitle(
   })
 }
 
-/** Extract a 160×120 baseline JPEG thumbnail for PSP XMB menu and MP4 covr atom. */
+/** Extract a 160×120 baseline JPEG thumbnail for the PSP XMB menu (.THM sidecar). */
 export async function extractThumbnail(file: File, atTimestamp = 5): Promise<Uint8Array | null> {
   let input: Input | null = null
   let chosenSample: VideoSample | null = null
@@ -375,6 +386,83 @@ class PipelineQueue<T> {
   }
 }
 
+// ---------- duplicate-frame skip (anime / limited animation) ----------
+const DEDUP_W = 64
+const DEDUP_H = 36
+const DEFAULT_DUP_BUDGET = 7000
+
+/**
+ * Detects runs of visually-identical consecutive frames by hashing each
+ * decoded frame down to a 64×36 thumbnail and comparing sum-of-absolute
+ * differences against the previous frame. Copied animation cels decode to
+ * bit-identical pixels, so a conservative budget only matches true
+ * duplicates (film grain / subtle motion still encodes normally).
+ *
+ * The caller retains ownership of every sample — this never closes them.
+ * Subtitle burn-in happens downstream of the hash, so the active cue text
+ * is part of the identity: a sub change forces a fresh encode.
+ */
+export class FrameDeduper {
+  private canvas: OffscreenCanvas | null = null
+  private ctx: OffscreenCanvasRenderingContext2D | null = null
+  private prev: Uint8Array | null = null
+  private prevSub = ""
+  checked = 0
+  skipped = 0
+
+  constructor(private readonly budget: number = DEFAULT_DUP_BUDGET) {}
+
+  isDuplicate(sample: VideoSample, subText = ""): boolean {
+    this.checked++
+    const cur = this.hash(sample)
+    if (!cur) {
+      this.prev = null
+      this.prevSub = subText
+      return false
+    }
+    if (this.prev && subText === this.prevSub && this.sad(cur, this.prev) <= this.budget) {
+      this.skipped++
+      return true
+    }
+    this.prev = cur
+    this.prevSub = subText
+    return false
+  }
+
+  private hash(sample: VideoSample): Uint8Array | null {
+    try {
+      if (typeof OffscreenCanvas === "undefined") return null
+      if (!this.canvas) {
+        this.canvas = new OffscreenCanvas(DEDUP_W, DEDUP_H)
+        this.ctx = this.canvas.getContext("2d", {
+          alpha: false,
+          willReadFrequently: true,
+        }) as OffscreenCanvasRenderingContext2D | null
+      }
+      const ctx = this.ctx
+      if (!ctx) return null
+      ctx.filter = "none"
+      ctx.imageSmoothingEnabled = true
+      ctx.fillStyle = "#000"
+      ctx.fillRect(0, 0, DEDUP_W, DEDUP_H)
+      sample.drawWithFit(ctx, { fit: "contain" })
+      return new Uint8Array(ctx.getImageData(0, 0, DEDUP_W, DEDUP_H).data)
+    } catch {
+      return null
+    }
+  }
+
+  private sad(a: Uint8Array, b: Uint8Array): number {
+    let s = 0
+    // Every 4th pixel, R+G+B — 576 samples, early exit past budget.
+    for (let i = 0; i < a.length; i += 16) {
+      s += Math.abs(a[i] - b[i]) + Math.abs(a[i + 1] - b[i + 1]) + Math.abs(a[i + 2] - b[i + 2])
+      if (s > this.budget) return s
+    }
+    return s
+  }
+}
+
 export async function convertFile(
   file: File,
   settings: ConvertSettings,
@@ -466,6 +554,12 @@ export async function convertFile(
       (aCfg?.numberOfChannels ?? 0) <= 2 &&
       (aCfg?.sampleRate === 44100 || aCfg?.sampleRate === 48000)
 
+    // Remux (packet passthrough) is only safe for Baseline sources. Main Profile
+    // sources usually carry B-frames, which the PSP hardware decoder cannot
+    // play ("This video could not be played") — proven on real hardware with
+    // Main L2.1 + has_b_frames=2 failing while Main L2.1 + has_b_frames=0
+    // plays. B-frame presence can't be detected client-side, so Main is
+    // always re-encoded to Baseline instead of passed through.
     const remuxOk =
       !seg &&
       !settings.trim &&
@@ -473,7 +567,7 @@ export async function convertFile(
       !settings.subtitleCues?.length &&
       !!vCfg &&
       vCfg.codec.startsWith("avc1") &&
-      (vProf === 66 || vProf === 77) &&
+      vProf === 66 &&
       vLevel <= 30 &&
       dw > 0 &&
       dh > 0 &&
@@ -521,15 +615,11 @@ export async function convertFile(
           attemptOutput.addAudioTrack(aSrc)
         }
 
+        // NOTE: title only — never embed cover art. The PSP firmware rejects
+        // files containing udta/meta/ilst/covr with "This video could not be
+        // played". Thumbnails ship as .THM sidecar files instead.
         const metaTitle = settings.title || cleanPspTitle(file.name)
-        if (thumbBytes) {
-          attemptOutput.setMetadataTags({
-            title: metaTitle,
-            images: [{ data: thumbBytes, mimeType: "image/jpeg", kind: "coverFront" }],
-          })
-        } else {
-          attemptOutput.setMetadataTags({ title: metaTitle })
-        }
+        attemptOutput.setMetadataTags({ title: metaTitle })
 
         await attemptOutput.start()
         const tick = makeTick(pass)
@@ -627,20 +717,15 @@ export async function convertFile(
             }
           }
 
+          // NOTE: title only — never embed cover art (see above: covr breaks PSP playback).
           const metaTitle = settings.title || cleanPspTitle(file.name)
-          if (thumbBytes) {
-            attemptOutput.setMetadataTags({
-              title: metaTitle,
-              images: [{ data: thumbBytes, mimeType: "image/jpeg", kind: "coverFront" }],
-            })
-          } else {
-            attemptOutput.setMetadataTags({ title: metaTitle })
-          }
+          attemptOutput.setMetadataTags({ title: metaTitle })
 
           await attemptOutput.start()
 
           let vFrac = 0
           let _vFrames = 0
+          const dedup = new FrameDeduper(tun.dupBudget)
           const targetFrameDuration = fps > 31 ? 1001 / 30000 : 0
           let lastAlignedTs: number | null = null
           let aFrac = aTrack && (audioSource || audioPacketSource) ? 0 : 1
@@ -699,6 +784,7 @@ export async function convertFile(
 
             const consumer = async (): Promise<void> => {
               let n = 0
+              let enc = 0
               let lastKeyTs = -999
               try {
                 while (true) {
@@ -709,10 +795,22 @@ export async function convertFile(
                     if ((tun.diagnostic ?? "full") === "decode") {
                       vFrac = Math.min(1, (sample.timestamp - rangeStart) / segSpan)
                     } else {
-                      const isKey = n === 0 || sample.timestamp - lastKeyTs >= 2.0
-                      if (isKey) lastKeyTs = sample.timestamp
-                      await videoSource!.add(sample, { keyFrame: isKey })
-                      vFrac = Math.min(1, (sample.timestamp - rangeStart) / segSpan)
+                      let subText = ""
+                      if (currentSubtitleCues && currentSubtitleCues.length > 0) {
+                        const cue = currentSubtitleCues.find(
+                          (c) => sample.timestamp >= c.start && sample.timestamp <= c.end
+                        )
+                        if (cue) subText = cue.text
+                      }
+                      if (dedup.isDuplicate(sample, subText)) {
+                        vFrac = Math.min(1, (sample.timestamp - rangeStart) / segSpan)
+                      } else {
+                        const isKey = enc === 0 || sample.timestamp - lastKeyTs >= 2.0
+                        if (isKey) lastKeyTs = sample.timestamp
+                        await videoSource!.add(sample, { keyFrame: isKey })
+                        vFrac = Math.min(1, (sample.timestamp - rangeStart) / segSpan)
+                        enc++
+                      }
                     }
                     n++
                     if (n % 30 === 0) {
@@ -817,6 +915,7 @@ export async function convertFile(
             await attemptOutput.finalize()
             const buf = attemptOutput.target.buffer
             if (!buf) throw new Error("Encoder produced no output.")
+            dupSkipped = dedup.skipped
             return buf
           } catch (e) {
             try {
@@ -844,6 +943,7 @@ export async function convertFile(
 
     let buffer: ArrayBuffer | null = null
     let how = ""
+    let dupSkipped = 0
     if (remuxOk && !cancelled()) {
       try {
         buffer = await remuxOnce("remuxing")
@@ -930,6 +1030,7 @@ export async function convertFile(
       `done — ${srcInfo} → ${dims}` +
       (capped ? ` · capped to source ~${Math.round(effVideoBitrate / 1000)}k` : "") +
       (settings.lcdBoost ? " · LCD Boosted" : "") +
+      (dupSkipped > 0 ? ` · skipped ${dupSkipped} dup frames` : "") +
       ` · ${how} in ${secs.toFixed(1)}s (probe ${probeSecs.toFixed(1)}s)`
 
     return {
@@ -1159,6 +1260,7 @@ export async function encodeSegmentDirect(
     let lastAlignedTs: number | null = null
     let first = true
     let lastKeyTs = -999
+    const dedup = new FrameDeduper(tun.dupBudget)
     const total = seg.end - seg.start
 
     try {
@@ -1180,14 +1282,19 @@ export async function encodeSegmentDirect(
           }
           lastAlignedTs = alignedTs
         }
-        const isKey = first || ts - lastKeyTs >= 2.0
-        if (isKey) lastKeyTs = ts
 
         let activeSub: string | undefined = undefined
         if (settings.subtitleCues && settings.subtitleCues.length > 0) {
           const cue = settings.subtitleCues.find((c) => ts >= c.start && ts <= c.end)
           if (cue) activeSub = cue.text
         }
+        if (dedup.isDuplicate(sample, activeSub ?? "")) {
+          sample.close()
+          report(Math.min(0.999, (ts - seg.start) / total), "converting segment")
+          continue
+        }
+        const isKey = first || ts - lastKeyTs >= 2.0
+        if (isKey) lastKeyTs = ts
         try {
           const frame = drawScaledToVideoFrame(
             sample,
@@ -1308,15 +1415,10 @@ export class SegmentedMuxer {
       }
     }
 
+    // NOTE: title only — never embed cover art (covr breaks PSP playback).
+    // The extracted thumbnail ships as a .THM sidecar via thmBuffer.
     const metaTitle = this.settings.title || cleanPspTitle(this.file.name)
-    if (this.thumbBytes) {
-      this.output.setMetadataTags({
-        title: metaTitle,
-        images: [{ data: this.thumbBytes, mimeType: "image/jpeg", kind: "coverFront" }],
-      })
-    } else {
-      this.output.setMetadataTags({ title: metaTitle })
-    }
+    this.output.setMetadataTags({ title: metaTitle })
 
     await this.output.start()
 
@@ -1500,14 +1602,8 @@ export async function convertMergedFiles(
   })
 
   const mergedTitle = settings.title || cleanPspTitle(files[0].name) + " (Marathon)"
-  if (thumbBytes) {
-    output.setMetadataTags({
-      title: mergedTitle,
-      images: [{ data: thumbBytes, mimeType: "image/jpeg", kind: "coverFront" }],
-    })
-  } else {
-    output.setMetadataTags({ title: mergedTitle })
-  }
+  // NOTE: title only — never embed cover art (covr breaks PSP playback).
+  output.setMetadataTags({ title: mergedTitle })
 
   const quantizer = resolveQuantizer(settings.videoBitrate)
   const videoQuality = new Quality({ quantizer, bitrate: settings.videoBitrate })
@@ -1559,6 +1655,7 @@ export async function convertMergedFiles(
       let fileMaxTs = 0
       let frameCount = 0
       let lastKeyTs = -999
+      const dedup = new FrameDeduper(settings.tunables?.dupBudget)
 
       for await (const sample of vSink.samples()) {
         if (cancelled()) {
@@ -1577,6 +1674,12 @@ export async function convertMergedFiles(
         }
         lastAlignedTs = alignedTs
         if (ts > fileMaxTs) fileMaxTs = ts
+
+        // Hash before setTimestamp mutates the sample below.
+        if (dedup.isDuplicate(sample)) {
+          sample.close()
+          continue
+        }
 
         const shiftedTs = alignedTs + timeOffset
         const isKey = frameCount === 0 || shiftedTs - lastKeyTs >= 2.0
@@ -1645,6 +1748,16 @@ export async function convertMergedFiles(
     await output.finalize()
     const buffer = output.target.buffer
     if (!buffer) throw new Error("Merge produced no output.")
+
+    // Fail loudly instead of shipping an unplayable marathon file: the PSP
+    // hardware decoder cannot play B-frames, so anything but Baseline L<=3.0
+    // here means an encoder ignored the Baseline codec string.
+    const mergeProf = parseAvcProfile(buffer)
+    if (!mergeProf || mergeProf.profileIdc !== 66 || mergeProf.levelIdc > 30) {
+      throw new Error(
+        `Merged output is not PSP-compliant Baseline (got profile ${mergeProf?.profileIdc ?? "?"} level ${mergeProf?.levelIdc ?? "?"})`
+      )
+    }
 
     const secs = (performance.now() - t0) / 1000
     const badge = profileBadge(parseAvcProfile(buffer))

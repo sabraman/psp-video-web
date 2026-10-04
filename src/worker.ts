@@ -123,6 +123,18 @@ async function runSegmented(msg: ConvertMsg, k: number): Promise<void> {
     )
 
     const buffer = await muxer.finalize()
+
+    // Segmented output must be Baseline: the PSP hardware decoder cannot play
+    // B-frames, and a non-Baseline stream here means an encoder ignored the
+    // Baseline codec string. Throwing falls through to the safe single-pass
+    // path below instead of shipping an unplayable file.
+    const segProf = parseAvcProfile(buffer)
+    if (!segProf || segProf.profileIdc !== 66 || segProf.levelIdc > 30) {
+      throw new Error(
+        `Segmented output is not PSP-compliant Baseline (got profile ${segProf?.profileIdc ?? "?"} level ${segProf?.levelIdc ?? "?"})`
+      )
+    }
+
     const secs = (performance.now() - t0) / 1000
 
     const badge = profileBadge(parseAvcProfile(buffer))
